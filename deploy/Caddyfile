@@ -1,0 +1,7 @@
+# Replace with the exact DNS name in PT_ORIGIN (without https://).
+terminal.example.com {
+    # Caddy preserves the request Host/Origin and handles WebSocket upgrades.
+    # PocketTerminal does not trust Forwarded/X-Forwarded-* as authentication.
+    reverse_proxy 127.0.0.1:3000
+    # No access log: never persist cookies, request bodies or terminal input.
+}

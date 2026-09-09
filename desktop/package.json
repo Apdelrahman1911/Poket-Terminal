@@ -1,0 +1,21 @@
+{
+  "name": "pocketdesktop",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "test:service": "python3 -I tests/service_test.py",
+    "test:limits": "python3 -I -B tests/limits_test.py"
+  },
+  "dependencies": {
+    "@novnc/novnc": "1.7.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

@@ -1,0 +1,30 @@
+[Unit]
+Description=PocketTerminal owner web gateway (independent tmux jobs)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/pocketterminal
+EnvironmentFile=/etc/pocketterminal/env
+ExecStart=/opt/pocketterminal/scripts/service.sh
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=3
+UMask=0077
+# The foreground Python supervisor terminates ONLY its web process group.
+# tmux servers/jobs survive web stop/restart; do not use control-group or mixed.
+KillMode=process
+KillSignal=SIGTERM
+TimeoutStopSec=20
+SendSIGKILL=no
+# Deliberately no PrivateTmp: the independent tmux socket must survive restarts.
+# Threads count here too; a low unit-wide TasksMax can starve owner tools.
+TasksMax=infinity
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

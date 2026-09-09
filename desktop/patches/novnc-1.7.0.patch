@@ -1,0 +1,350 @@
+--- a/core/display.js
++++ b/core/display.js
+@@ -187,6 +187,9 @@
+     }
+ 
+     resize(width, height) {
++        if (width > 1280 || height > 720 || width < 0 || height < 0) {
++            throw new Error('PocketDesktop framebuffer limit');
++        }
+         this._prevDrawStyle = "";
+ 
+         this._fbWidth = width;
+@@ -367,11 +370,14 @@
+             return;
+         }
+ 
++        const cost = arr.byteLength * 3 + width * height * 4;
++        this._checkRenderBudget(cost);
+         const img = new Image();
+         img.src = "data: " + mime + ";base64," + Base64.encode(arr);
+ 
+         this._renderQPush({
+             'type': 'img',
++            'cost': cost,
+             'img': img,
+             'x': x,
+             'y': y,
+@@ -396,6 +402,7 @@
+             // NB(directxman12): it's technically more performant here to use preallocated arrays,
+             // but it's a lot of extra work for not a lot of payoff -- if we're using the render queue,
+             // this probably isn't getting called *nearly* as much
++            this._checkRenderBudget(width * height * 4);
+             const newArr = new Uint8Array(width * height * 4);
+             newArr.set(new Uint8Array(arr.buffer, 0, newArr.length));
+             this._renderQPush({
+@@ -479,7 +486,40 @@
+         }
+     }
+ 
++    // PocketDesktop: checked BEFORE image/base64/typed-array allocation and again
++    // when enqueued. Cost accounts for decoded images plus encoded data URLs.
++    _checkRenderBudget(bytes) {
++        const queued = this._renderQ.reduce((n, action) => n + action.cost, 0);
++        if (this._disposed || this._renderQ.length >= 128 || queued + bytes > 8 * 1024 * 1024) {
++            throw new Error('PocketDesktop render queue limit');
++        }
++    }
++
++    dispose() {
++        if (this._disposed) return;
++        this._disposed = true;
++        for (const action of this._renderQ) {
++            if (action.img) {
++                action.img.removeEventListener('load', this._resumeRenderQ);
++                action.img._noVNCDisplay = null;
++                action.img.src = '';
++            }
++        }
++        this._renderQ.length = 0;
++        if (this._flushResolve) this._flushResolve();
++        this._flushPromise = this._flushResolve = null;
++        this._target.width = this._target.height = 0;
++        this._backbuffer.width = this._backbuffer.height = 0;
++    }
++
++    get queueStats() {
++        return { actions: this._renderQ.length,
++                 bytes: this._renderQ.reduce((n, action) => n + action.cost, 0) };
++    }
++
+     _renderQPush(action) {
++        action.cost = action.cost || (action.data ? action.data.byteLength : 64);
++        this._checkRenderBudget(action.cost);
+         this._renderQ.push(action);
+         if (this._renderQ.length === 1) {
+             // If this can be rendered immediately it will be, otherwise
+@@ -496,6 +536,7 @@
+     }
+ 
+     _scanRenderQ() {
++        if (this._disposed) return;
+         let ready = true;
+         while (ready && this._renderQ.length > 0) {
+             const a = this._renderQ[0];
+--- a/core/inflator.js
++++ b/core/inflator.js
+@@ -34,6 +34,9 @@
+     }
+ 
+     inflate(expected) {
++        if (!Number.isSafeInteger(expected) || expected < 0 || expected > 4 * 1024 * 1024) {
++            throw new Error('PocketDesktop inflate limit');
++        }
+         // resize our output buffer if it's too small
+         // (we could just use multiple chunks, but that would cause an extra
+         // allocation each time to flatten the chunks)
+--- a/core/input/keyboard.js
++++ b/core/input/keyboard.js
+@@ -280,6 +280,8 @@
+     }
+ 
+     ungrab() {
++        clearTimeout(this._altGrTimeout);
++        this._altGrArmed = false;
+         //Log.Debug(">> Keyboard.ungrab");
+ 
+         this._target.removeEventListener('keydown', this._eventHandlers.keydown);
+--- a/core/rfb.js
++++ b/core/rfb.js
+@@ -12,7 +12,7 @@
+ import { encodeUTF8, decodeUTF8 } from './util/strings.js';
+ import { dragThreshold, supportsWebCodecsH264Decode } from './util/browser.js';
+ import { clientToElement } from './util/element.js';
+-import { setCapture } from './util/events.js';
++import { setCapture, disposeCapture } from './util/events.js';
+ import EventTargetMixin from './util/eventtarget.js';
+ import Display from "./display.js";
+ import Inflator from "./inflator.js";
+@@ -248,14 +248,7 @@
+         // populate decoder array with objects
+         this._decoders[encodings.encodingRaw] = new RawDecoder();
+         this._decoders[encodings.encodingCopyRect] = new CopyRectDecoder();
+-        this._decoders[encodings.encodingRRE] = new RREDecoder();
+-        this._decoders[encodings.encodingHextile] = new HextileDecoder();
+-        this._decoders[encodings.encodingZlib] = new ZlibDecoder();
+         this._decoders[encodings.encodingTight] = new TightDecoder();
+-        this._decoders[encodings.encodingTightPNG] = new TightPNGDecoder();
+-        this._decoders[encodings.encodingZRLE] = new ZRLEDecoder();
+-        this._decoders[encodings.encodingJPEG] = new JPEGDecoder();
+-        this._decoders[encodings.encodingH264] = new H264Decoder();
+ 
+         // NB: nothing that needs explicit teardown should be done
+         // before this point, since this can throw an exception
+@@ -415,6 +408,27 @@
+ 
+     // ===== PUBLIC METHODS =====
+ 
++    // PocketDesktop public lifecycle and non-sensitive queue instrumentation.
++    dispose() {
++        if (this._pocketDisposed) return;
++        this._pocketDisposed = true;
++        if (this._rfbConnectionState !== 'disconnected') {
++            this.disconnect();
++            this._updateConnectionState('disconnected');
++        }
++        disposeCapture();
++        this._display.dispose();
++        this._sock.dispose();
++        this._decoders = {}; // The three enabled decoders own only bounded JS arrays.
++        this._clipboardText = null;
++        this._listeners.clear();
++    }
++
++    get queueStats() {
++        return { receiveBytes: this._sock.rQlen(), receiveCapacity: this._sock._rQbufferSize,
++                 render: this._display.queueStats, pending: this._display.pending() };
++    }
++
+     disconnect() {
+         this._updateConnectionState('disconnecting');
+         this._sock.off('error');
+@@ -499,6 +513,9 @@
+ 
+     clipboardPasteFrom(text) {
+         if (this._rfbConnectionState !== 'connected' || this._viewOnly) { return; }
++        if (text.length > 4096 || /[^\x00-\xff]/.test(text)) {
++            throw new Error('PocketDesktop clipboard is bounded Latin-1 text');
++        }
+ 
+         if (this._clipboardServerCapabilitiesFormats[extendedClipboardFormatText] &&
+             this._clipboardServerCapabilitiesActions[extendedClipboardActionNotify]) {
+@@ -2232,16 +2249,7 @@
+         encs.push(encodings.encodingCopyRect);
+         // Only supported with full depth support
+         if (this._fbDepth == 24) {
+-            if (supportsWebCodecsH264Decode) {
+-                encs.push(encodings.encodingH264);
+-            }
+             encs.push(encodings.encodingTight);
+-            encs.push(encodings.encodingTightPNG);
+-            encs.push(encodings.encodingZRLE);
+-            encs.push(encodings.encodingJPEG);
+-            encs.push(encodings.encodingHextile);
+-            encs.push(encodings.encodingRRE);
+-            encs.push(encodings.encodingZlib);
+         }
+         encs.push(encodings.encodingRaw);
+ 
+@@ -2254,11 +2262,9 @@
+         encs.push(encodings.pseudoEncodingQEMUExtendedKeyEvent);
+         encs.push(encodings.pseudoEncodingQEMULedEvent);
+         encs.push(encodings.pseudoEncodingExtendedDesktopSize);
+-        encs.push(encodings.pseudoEncodingXvp);
+         encs.push(encodings.pseudoEncodingFence);
+         encs.push(encodings.pseudoEncodingContinuousUpdates);
+         encs.push(encodings.pseudoEncodingDesktopName);
+-        encs.push(encodings.pseudoEncodingExtendedClipboard);
+         encs.push(encodings.pseudoEncodingExtendedMouseButtons);
+ 
+         if (this._fbDepth == 24) {
+@@ -2324,6 +2330,9 @@
+     }
+ 
+     _handleServerCutText() {
++        // Disabled at TigerVNC too. Refuse BEFORE reading/allocating/decompressing
++        // any server clipboard payload, including extended clipboard zip bombs.
++        return this._fail('PocketDesktop server clipboard disabled');
+         Log.Debug("ServerCutText");
+ 
+         if (this._sock.rQwait("ServerCutText header", 7, 1)) { return false; }
+@@ -2626,6 +2635,7 @@
+                 this._flushing = true;
+                 this._display.flush()
+                     .then(() => {
++                        if (this._pocketDisposed || this._rfbConnectionState !== 'connected') return;
+                         this._flushing = false;
+                         // Resume processing
+                         if (!this._sock.rQwait("message", 1)) {
+@@ -2664,6 +2674,11 @@
+     }
+ 
+     _handleRect() {
++        if (this._FBU.width > 1280 || this._FBU.height > 720 ||
++            (this._FBU.encoding >= 0 && (this._FBU.x + this._FBU.width > this._fbWidth ||
++                                        this._FBU.y + this._FBU.height > this._fbHeight))) {
++            return this._fail('PocketDesktop rectangle limit');
++        }
+         switch (this._FBU.encoding) {
+             case encodings.pseudoEncodingLastRect:
+                 this._FBU.rects = 1; // Will be decreased when we return
+--- a/core/util/browser.js
++++ b/core/util/browser.js
+@@ -149,7 +149,7 @@
+ 
+     return true;
+ }
+-supportsWebCodecsH264Decode = await _checkWebCodecsH264DecodeSupport();
++// PocketDesktop does not use/probe WebCodecs, H.264 or background video decoders.
+ 
+ /*
+  * The functions for detection of platforms and browsers below are exported
+--- a/core/util/cursor.js
++++ b/core/util/cursor.js
+@@ -58,6 +58,8 @@
+     }
+ 
+     detach() {
++        clearTimeout(this._captureTimer);
++        this._canvas.width = this._canvas.height = 0;
+         if (!this._target) {
+             return;
+         }
+@@ -174,7 +176,8 @@
+         // browser to flush all events and then check again if the cursor
+         // should be visible.
+         if (this._captureIsActive()) {
+-            window.setTimeout(() => {
++            clearTimeout(this._captureTimer);
++            this._captureTimer = window.setTimeout(() => {
+                 // We might have detached at this point
+                 if (!this._target) {
+                     return;
+--- a/core/util/events.js
++++ b/core/util/events.js
+@@ -33,7 +33,7 @@
+     _captureRecursion = true;
+     if (document.captureElement) {
+         document.captureElement.dispatchEvent(newEv);
+-    } else {
++    } else if (_elementForUnflushedEvents) {
+         _elementForUnflushedEvents.dispatchEvent(newEv);
+     }
+     _captureRecursion = false;
+@@ -107,6 +107,15 @@
+     }
+ }
+ 
++// PocketDesktop has one RFB view. Release its global capture observer/listeners
++// and the last detached canvas reference, including navigation mid-drag.
++export function disposeCapture() {
++    releaseCapture();
++    _captureObserver.disconnect();
++    _elementForUnflushedEvents = null;
++    document.getElementById('noVNC_mouse_capture_elem')?.remove();
++}
++
+ export function releaseCapture() {
+     if (document.releaseCapture) {
+ 
+--- a/core/websock.js
++++ b/core/websock.js
+@@ -17,7 +17,7 @@
+ // this has performance issues in some versions Chromium, and
+ // doesn't gain a tremendous amount of performance increase in Firefox
+ // at the moment.  It may be valuable to turn it on in the future.
+-const MAX_RQ_GROW_SIZE = 40 * 1024 * 1024;  // 40 MiB
++const MAX_RQ_GROW_SIZE = 4 * 1024 * 1024;  // PocketDesktop hard receive cap
+ 
+ // Constants pulled from RTCDataChannelState enum
+ // https://developer.mozilla.org/en-US/docs/Web/API/RTCDataChannel/readyState#RTCDataChannelState_enum
+@@ -53,7 +53,7 @@
+ 
+         this._rQi = 0;           // Receive queue index
+         this._rQlen = 0;         // Next write position in the receive queue
+-        this._rQbufferSize = 1024 * 1024 * 4; // Receive queue buffer size (4 MiB)
++        this._rQbufferSize = 128 * 1024; // PocketDesktop small initial receive queue
+         // called in init: this._rQ = new Uint8Array(this._rQbufferSize);
+         this._rQ = null; // Receive queue
+ 
+@@ -220,6 +220,9 @@
+ 
+     flush() {
+         if (this._sQlen > 0 && this.readyState === 'open') {
++            if ((this._websocket.bufferedAmount || 0) + this._sQlen > 64 * 1024) {
++                throw new Error('PocketDesktop send queue limit');
++            }
+             this._websocket.send(new Uint8Array(this._sQ.buffer, 0, this._sQlen));
+             this._sQlen = 0;
+         }
+@@ -304,6 +307,20 @@
+ 
+             this._websocket.onmessage = () => {};
+         }
++    }
++
++    // PocketDesktop: deterministic teardown, not external private-field cleanup.
++    dispose() {
++        this.close();
++        if (this._websocket) {
++            for (const name of ['onmessage', 'onopen', 'onclose', 'onerror']) {
++                this._websocket[name] = null;
++            }
++        }
++        this._websocket = null;
++        for (const name of Object.keys(this._eventHandlers)) this.off(name);
++        this._rQ = this._sQ = new Uint8Array(0);
++        this._rQi = this._rQlen = this._sQlen = 0;
+     }
+ 
+     // private methods
+@@ -354,6 +371,9 @@
+             this._rQi = 0;
+         }
+         const u8 = new Uint8Array(e.data);
++        if (u8.length > 64 * 1024 || this.rQlen() + u8.length > MAX_RQ_GROW_SIZE) {
++            throw new Error('PocketDesktop receive queue limit');
++        }
+         if (u8.length > this._rQbufferSize - this._rQlen) {
+             this._expandCompactRQ(u8.length);
+         }

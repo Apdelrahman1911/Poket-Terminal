@@ -1,0 +1,45 @@
+{
+  "name": "pocketterminal",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0 <25"
+  },
+  "scripts": {
+    "build": "npm run typecheck && tsc -p tsconfig.server.json && vite build",
+    "typecheck": "tsc -p tsconfig.server.json --noEmit && tsc -p tsconfig.client.json --noEmit",
+    "test": "tsx --test --test-concurrency=1 tests/*.test.ts",
+    "test:browser": "playwright test",
+    "password": "node dist/server/password.js",
+    "telegram": "node dist/server/telegram-cli.js",
+    "start": "./scripts/service.sh",
+    "backup": "node dist/server/backup.js",
+    "bench": "tsx scripts/benchmark.ts",
+    "bench:supervisors": "tsx scripts/compare-supervisors.ts",
+    "bench:analyze": "python3 scripts/analyze-memory.py",
+    "test:publication": "tsx --test --test-concurrency=1 tests/publication.test.ts tests/security.test.ts tests/deployment.test.ts tests/telegram-setup.test.ts tests/telegram-cli.test.ts tests/desktop.test.ts"
+  },
+  "dependencies": {
+    "@node-rs/argon2": "2.2.0",
+    "@xterm/addon-fit": "0.11.0",
+    "@xterm/xterm": "6.0.0",
+    "fastify": "5.12.3",
+    "node-pty": "1.1.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "ws": "8.21.3"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0",
+    "@types/node": "24.13.3",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.7",
+    "@types/ws": "8.18.1",
+    "@vitejs/plugin-react": "6.1.1",
+    "pm2": "7.0.4",
+    "tsx": "4.23.13",
+    "typescript": "5.9.3",
+    "vite": "8.2.2"
+  }
+}

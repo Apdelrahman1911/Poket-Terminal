@@ -1,0 +1,9 @@
+[Configuration]
+CommandRunCustomCommand=TRUE
+CommandCustomCommand=/bin/bash
+CommandLoginShell=FALSE
+MiscAlwaysShowTabs=FALSE
+MiscBell=FALSE
+MiscDefaultGeometry=90x24
+ScrollingLines=1000
+ScrollingUnlimited=FALSE

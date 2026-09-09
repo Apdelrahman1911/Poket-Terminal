@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Terminal
+Comment=Unprivileged desktop shell (not the root PocketTerminal)
+Exec=xfce4-terminal --disable-server
+Icon=utilities-terminal
+Terminal=false

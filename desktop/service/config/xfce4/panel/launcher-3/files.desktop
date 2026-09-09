@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Files
+Comment=Your private desktop home
+Exec=thunar
+Icon=system-file-manager
+Terminal=false

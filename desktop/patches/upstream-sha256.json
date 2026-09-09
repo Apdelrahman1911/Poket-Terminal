@@ -1,0 +1,10 @@
+{
+  "core/display.js": "10d298551124a172c97dcb54d8d30fca416e6038b064c93ba5f7cf079fa4bf1f",
+  "core/inflator.js": "b1955cbd1608619911b8dfd451fae07f38c5767098f6f47e4a2a1682c11feb65",
+  "core/input/keyboard.js": "46f82adef772b726ae3db144fb9c12b3d03374b7c803b8a5106e422a10ddcdba",
+  "core/rfb.js": "c46dfefbf869eda0c6d06c5dd86c42e96fc8a77c125e91599a2cdf3841261564",
+  "core/util/browser.js": "592f56dc2195331c3b8329f8e51fa3a444a89ac85d5fa29e2364508aa9303df7",
+  "core/util/cursor.js": "adabe605d73f38e5f29abd302489d4b9e98a9e495823a06a2edbe7f6744856fa",
+  "core/util/events.js": "ec7f4da0407ea67f5d6f5ce53bd9b3342155feb9407707de3992c5261e460ead",
+  "core/websock.js": "d1a96fc1316eaab9badcba9b0f1a7a55d748a4d4d26dc0263cc179dba2131cf4"
+}

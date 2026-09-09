@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="color-scheme" content="dark"><title>PocketDesktop</title><link rel="stylesheet" href="/desktop/desktop.css"></head>
+<body><main>
+  <header><a id="back" href="/">← Terminals</a><strong>PocketDesktop <small>PRIVATE</small></strong><button id="logout">Log out</button></header>
+  <p id="status" role="status" aria-live="polite">Sign in to PocketTerminal, then open Desktop.</p>
+  <nav aria-label="Desktop controls"><button id="connect">Connect</button><button id="disconnect" disabled>Disconnect</button><button id="fit" aria-pressed="false">Fit screen</button><button id="keyboard">Keyboard</button><button id="clipboard">Clipboard</button></nav>
+  <section id="screen" aria-label="Remote desktop"></section>
+  <section id="keyboard-panel" class="input-panel" aria-label="Keyboard controls" hidden>
+    <div class="keys"><button id="ctrl" data-input aria-pressed="false">Ctrl</button><button id="alt" data-input aria-pressed="false">Alt</button><button data-input data-key="65307">Esc</button><button data-input data-key="65289">Tab</button><button data-input data-key="65288">⌫</button><button data-input data-key="65361" aria-label="Left">←</button><button data-input data-key="65362" aria-label="Up">↑</button><button data-input data-key="65364" aria-label="Down">↓</button><button data-input data-key="65363" aria-label="Right">→</button><button data-input data-key="65293">Enter</button></div>
+    <label for="type-text">Type text · up to 128 characters / 512 bytes</label><div class="compose"><textarea id="type-text" data-input rows="1" maxlength="256" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea><button id="type-send" data-input>Send keys</button></div>
+  </section>
+  <section id="clipboard-panel" class="input-panel" aria-label="Manual clipboard" hidden>
+    <label for="clipboard-text">Paste text here manually · Latin-1, 4 KiB max</label><div class="compose"><textarea id="clipboard-text" data-input rows="2" maxlength="4096" autocomplete="off" spellcheck="false"></textarea><button id="clipboard-send" data-input>Send to clipboard</button></div><small>Then paste inside the desktop. Desktop → browser clipboard and file transfer are disabled. No automatic clipboard access.</small>
+  </section>
+  <footer>One 1280×720 desktop. Fit or pan on your phone. Disconnecting does not stop apps. Root projects stay private. <a href="/desktop/LICENSES.txt">Licenses</a></footer>
+</main><script type="module" src="/desktop/desktop.js"></script></body></html>
