@@ -25,3 +25,29 @@ own `.runtime` and refuses to overwrite a `FROZEN.json` candidate. No build star
 a GUI or installs packages/services. Provisioning is a separate explicit root
 operator command. No browser, heavyweight desktop browser or GUI is installed
 by `npm ci`/build. Source-only limit tests invoke no native service.
+
+## Fullscreen and administrator access
+
+Use **Full screen** in the desktop toolbar. Where the browser supports the
+Fullscreen API, this enters browser fullscreen; otherwise **expanded view**
+hides the page header/help/footer while retaining an always-reachable exit button.
+Press **Escape** or the exit button to return. Other controls scroll horizontally
+on a narrow screen. Use the toolbar's **Esc** key to send Escape to a desktop app.
+Fullscreen scales the same fixed 1280×720 desktop; it does not start another
+renderer, connection, native process, or a larger framebuffer.
+
+**Permission denied in `/root` is intentional.** The GUI/browser account is
+unprivileged and cannot read root credentials or root-owned projects. Open
+**Terminals**, create/select a **Shell**, and run `cd /root` for administrator
+commands; that shell already runs as root. Normal desktop files belong in the
+desktop user's Home folder. Do not make `/root` public, grant the GUI passwordless
+sudo, or run Chrome as root to work around the separation. Sharing a specific
+project directory requires a separate explicit, scoped operator decision.
+
+Lightweight fullscreen tests: `npm --prefix desktop test` and, from the repository
+root, `npm run test:desktop-ui`. The browser tests use a synthetic in-memory RFB
+peer, not a real VPS desktop or owner login. Run them as a normal non-root user
+with sandboxed Playwright Chromium (`npx playwright install chromium --only-shell`).
+They check native fullscreen, mobile expanded-view fallback, fixed framebuffer
+dimensions, one socket/renderer across toggles, and cached-page reconnection.
+Physical-phone fullscreen/browser-chrome behavior still depends on the browser.

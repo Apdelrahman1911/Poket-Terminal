@@ -2,10 +2,15 @@ import RFB from '../vendor/novnc/core/rfb.js';
 import { initLogging } from '../vendor/novnc/core/util/logging.js';
 import { BoundedChannel } from './channel.js';
 import { CloseGate } from './close-gate.js';
+import { installFullscreen } from './fullscreen.js';
 
 initLogging('none'); // Never log framebuffer, clipboard, native input or auth values.
 const $ = id => document.getElementById(id);
 const host = $('screen'), status = $('status');
+// An in-flight old HTML response may finish while a new asset release is activated.
+const fullscreen = $('fullscreen') ? installFullscreen(document.documentElement, $('fullscreen')) : {
+  reset() {}, dispose() {}, stats: () => ({ mode: 'none', pending: false, listeners: 0 }),
+};
 let live = null, auth = null, generation = 0, controller = null, deadline = null, expiry = null;
 const retirement = new CloseGate();
 let busy = false, manualPause = false, frozen = false, fit = true, ctrl = false, alt = false;
@@ -89,9 +94,15 @@ function foreground() {
 document.addEventListener('visibilitychange', foreground);
 document.addEventListener('freeze', () => { frozen = true; foreground(); });
 document.addEventListener('resume', () => { frozen = false; foreground(); });
-window.addEventListener('pagehide', () => { frozen = true; foreground(); });
+window.addEventListener('pagehide', event => {
+  fullscreen.reset();
+  if (event.persisted === false) fullscreen.dispose();
+  frozen = true; foreground();
+});
 window.addEventListener('pageshow', () => { frozen = false; foreground(); });
-$('back').addEventListener('click', () => dispose('Returning to terminals…'));
+for (const id of ['back', 'root-terminal']) $(id)?.addEventListener('click', () => {
+  fullscreen.reset(); dispose('Returning to terminals…');
+});
 $('connect').addEventListener('click', () => { manualPause = false; void connect(); });
 $('disconnect').addEventListener('click', () => { manualPause = true; dispose('Disconnected by you. Desktop apps keep running.'); });
 $('fit').addEventListener('click', () => {
@@ -142,6 +153,7 @@ $('clipboard-send').addEventListener('click', () => {
   catch { dispose('Clipboard send failed. Input will not be replayed.'); }
 });
 $('logout').addEventListener('click', async () => {
+  fullscreen.reset();
   const csrf = auth?.csrf; manualPause = true; dispose('Signing out…');
   if (!csrf) { message('Use PocketTerminal to sign in or out.'); return; }
   try { await api('/api/logout', 'POST', csrf, AbortSignal.timeout(8000)); message('Signed out. Desktop apps keep running.'); }
@@ -149,7 +161,7 @@ $('logout').addEventListener('click', async () => {
 });
 // Non-sensitive local diagnostics only: no framebuffer/input/auth objects exposed.
 window.pocketDesktopStats = () => ({ renderers: live ? 1 : 0, busy, inputQueued: typeJob ? typeJob.chars.length - typeJob.index : 0,
-  inputTimers: typeTimer ? 1 : 0, ...retirement.stats(), ...(live ? { queues: live.rfb.queueStats, channel: live.channel.stats() } : {}) });
+  inputTimers: typeTimer ? 1 : 0, fullscreen: fullscreen.stats(), ...retirement.stats(), ...(live ? { queues: live.rfb.queueStats, channel: live.channel.stats() } : {}) });
 controls(false);
 if (location.protocol === 'http:') { const secure = new URL('/desktop/', location.href); secure.protocol = 'https:'; location.replace(secure.href); }
 else if (location.protocol !== 'https:') throw new Error('HTTPS is required');

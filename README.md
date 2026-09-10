@@ -335,6 +335,11 @@ control.** Do not send credentials. Full steps: [docs/telegram.md](docs/telegram
 ## Optional private desktop
 
 Desktop is **off/unprovisioned by default**, with no additional public port.
+Once enabled, use **Full screen** in its toolbar (expanded-page fallback on
+unsupported mobile browsers), and **Escape** or the exit button to return.
+This reuses the same connection/renderer and fixed-size framebuffer. `/root`
+remains private: use the website's root **Shell** for administrator commands,
+not the unprivileged desktop file manager. See [desktop controls](desktop/README.md#fullscreen-and-administrator-access).
 See the complete [desktop installation, activation and rollback](desktop/DEPLOYMENT.md).
 In short, on the new host only:
 

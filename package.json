@@ -11,6 +11,7 @@
     "typecheck": "tsc -p tsconfig.server.json --noEmit && tsc -p tsconfig.client.json --noEmit",
     "test": "tsx --test --test-concurrency=1 tests/*.test.ts",
     "test:browser": "playwright test",
+    "test:desktop-ui": "npm --prefix desktop run build && playwright test -c playwright.desktop-ui.config.ts",
     "password": "node dist/server/password.js",
     "telegram": "node dist/server/telegram-cli.js",
     "start": "./scripts/service.sh",
