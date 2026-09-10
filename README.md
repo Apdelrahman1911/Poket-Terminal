@@ -362,6 +362,9 @@ control.** Do not send credentials. Full steps: [docs/telegram.md](docs/telegram
 For **one bot controlling several VPSs**, follow [fleet setup](docs/telegram-fleet.md)
 instead of pairing the same token on each host. `/servers` changes the command
 target; **notifications keep arriving from every linked VPS** with clear labels.
+Slow provider/public hops can use an [optional encrypted private-network route](docs/telegram-fleet.md#optional-encrypted-private-network-link)
+without another daemon or exposing a new public port. Polling never holds up the
+bounded outgoing reply lane.
 
 ## Optional private desktop
 

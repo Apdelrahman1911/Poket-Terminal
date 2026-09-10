@@ -18,6 +18,7 @@ export async function fakeTelegram() {
   const sockets = new Set<net.Socket>();
   const fake = { username: BOT_USERNAME, botId: BOT_ID, webhook: '', delay: 15, fail: '', oversized: '', hang: '', rateLimited: '',
     calls, sent, queue, endpoint: '', maxActive: 0, active: 0,
+    activePolls: 0, maxPolls: 0, activeOutgoing: 0, maxOutgoing: 0,
     enqueue(update: Record<string, unknown>) { if (queue.length >= 128) throw new Error('Synthetic fake queue cap'); queue.push(update); },
     async close() { for (const s of sockets) s.destroy(); await new Promise<void>(r => server.close(() => r())); },
   };
@@ -29,7 +30,9 @@ export async function fakeTelegram() {
     for await (const part of req) { raw += part; if (raw.length > 32768) { req.destroy(); return; } }
     let body: any; try { body = JSON.parse(raw); } catch { res.writeHead(400).end(); return; }
     fake.active++; fake.maxActive = Math.max(fake.maxActive, fake.active);
-    res.once('close', () => { fake.active--; });
+    if (method === 'getUpdates') { fake.activePolls++; fake.maxPolls = Math.max(fake.maxPolls, fake.activePolls); }
+    else { fake.activeOutgoing++; fake.maxOutgoing = Math.max(fake.maxOutgoing, fake.activeOutgoing); }
+    res.once('close', () => { fake.active--; if (method === 'getUpdates') fake.activePolls--; else fake.activeOutgoing--; });
     if (calls.length >= 512) calls.shift(); calls.push({ method, body });
     if (fake.hang === method) return;
     if (fake.oversized === method) { res.end('x'.repeat(65537)); return; }

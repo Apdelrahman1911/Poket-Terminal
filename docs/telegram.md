@@ -147,7 +147,9 @@ API/CLI errors. Notification-off continues baseline observations without deliver
 
 - Existing Node process/builtin HTTPS; one long poll, limit1,3s server wait;10s HTTP
   deadline (5s other API calls),64KiB response,24KiB request, no redirects/raw errors.
-- At most one API request/effect at a time; ≥300ms poll completion delay, ≤1 private
+- Standalone: at most one API request/effect at a time. Fleet: one polling socket
+  plus one bounded, serialized outgoing lane; an idle long poll does not block
+  replies. Both modes retain ≥300ms poll completion delay, ≤1 private
   message/1.05s, capped exponential/429 backoff≤60s. No offline outbox or input retry.
 - Durable file+directory-fsynced update cursor claimed **before** effects:
   **at-most-once**, not exactly-once. Crashes can lose an action/receipt.

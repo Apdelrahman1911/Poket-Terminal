@@ -4,14 +4,17 @@ import { createInterface } from 'node:readline/promises';
 import { configFromEnv } from './config.js';
 import { FleetState, fleetRecord } from './telegram-fleet-state.js';
 import { initializeFleet, addFleetWorker, joinFleet, enableFleetWorker, removeFleetWorker } from './telegram-fleet-setup.js';
+import { FleetLinkState, validateFleetLink } from './telegram-fleet-link.js';
 
 async function main() {
   process.umask(0o077);
   const [mode, arg, file, ...extra] = process.argv.slice(2), config = configFromEnv();
-  if (extra.length || !['init', 'add', 'join', 'enable', 'remove', 'status'].includes(mode || '')) throw new Error('usage');
+  if (extra.length || !['init', 'add', 'join', 'enable', 'remove', 'status', 'private', 'public'].includes(mode || '')) throw new Error('usage');
   if (mode === 'status') {
     if (arg || file) throw new Error('usage');
     const fleet = new FleetState(config).load();
+    const link = new FleetLinkState(config).load();
+    if (link) process.stdout.write(`Private certificate-verified TLS ${link.role === 'controller' ? 'listener' : 'route'}: ${link.address}:${link.port}.\n`);
     process.stdout.write(!fleet ? 'Standalone bot. No fleet configured.\n' : fleet.role === 'worker'
       ? `Worker ${fleet.node.label} (${fleet.node.id}); controller ${fleet.controller}. No Telegram token/poller required.\n`
       : `Controller ${fleet.local.label} (${fleet.local.id}); ${fleet.workers.length} linked workers.\n${fleet.workers.map(w => `${w.label}: ${w.id}`).join('\n')}\n`);
@@ -24,7 +27,7 @@ async function main() {
     }
     return;
   }
-  if ((mode === 'add' && (!arg || !file)) || (['init', 'join', 'remove'].includes(mode!) && (!arg || file)) || (mode === 'enable' && (arg || file))) throw new Error('usage');
+  if ((['add', 'private'].includes(mode!) && (!arg || !file)) || (['init', 'join', 'remove'].includes(mode!) && (!arg || file)) || (['enable', 'public'].includes(mode!) && (arg || file))) throw new Error('usage');
   if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error('Private root SSH TTY required');
   const io = createInterface({ input: process.stdin, output: process.stdout });
   try {
@@ -55,5 +58,13 @@ async function main() {
     process.stdout.write(`Worker ${node.label} (${node.id}) configured. Reload ONLY the web backend, then delete invitation copies. Notifications from all workers are independent of /servers selection.\n`);
   } else if (mode === 'enable') { await enableFleetWorker(config); process.stdout.write('Worker enabled; connection/identity still verified by the controller. Jobs preserved.\n'); }
   else if (mode === 'remove') { await removeFleetWorker(config, arg!); process.stdout.write('Worker credential revoked on this controller. In-flight effects may have occurred; nothing retried. Jobs preserved.\n'); }
+  else if (mode === 'private' || mode === 'public') {
+    const state = new FleetLinkState(config), fleet = config.telegramFleet;
+    if (!fleet) throw new Error('Fleet required');
+    const link = mode === 'private' ? validateFleetLink({ version: 1, role: fleet.role, address: arg, port: /^\d{4,5}$/.test(file!) ? Number(file) : 0 }, config.testMode) : undefined;
+    if (link) state.materials(link.role);
+    await state.withControlLock(() => state.save(link));
+    process.stdout.write('Fleet transport configured. Reload ONLY this web backend; jobs, owner binding and notification preferences are unchanged. Private mode has no insecure/public fallback.\n');
+  }
 }
-main().catch(() => { process.stderr.write('Fleet setup refused/cancelled. Check private TTY, safe files, paired owner, role and arguments. No credentials/errors were logged.\nUsage: npm run fleet -- init LABEL | add LABEL /private/invite.json | join /private/invite.json | enable | remove NODE_ID | status\n'); process.exitCode = 1; });
+main().catch(() => { process.stderr.write('Fleet setup refused/cancelled. Check private TTY, safe files, paired owner, role and arguments. No credentials/errors were logged.\nUsage: npm run fleet -- init LABEL | add LABEL /private/invite.json | join /private/invite.json | enable | remove NODE_ID | status | private RFC1918_IP PORT | public\n'); process.exitCode = 1; });

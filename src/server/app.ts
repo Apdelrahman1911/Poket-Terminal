@@ -14,6 +14,7 @@ import { TelegramApiError } from './telegram-api.js';
 import { TelegramState } from './telegram-state.js';
 import { TelegramFleetHub } from './telegram-fleet-hub.js';
 import { FleetRemoteTransport } from './telegram-fleet-client.js';
+import { FleetLinkState, FleetPrivateListener } from './telegram-fleet-link.js';
 import { FLEET_LIMITS, FleetState, FleetLocalState, sameBinding, currentBinding } from './telegram-fleet-state.js';
 import { Desktop } from './desktop.js';
 import type { NativeRunner } from './native-input.js';
@@ -21,6 +22,8 @@ import type { CodexControl } from './codex-control.js';
 
 export async function createApp(config: Config, options: { tmux?: TmuxRunner; now?: () => number; telegram?: { endpoint: string; now?: () => number }; nativeRunner?: NativeRunner; codexControl?: CodexControl } = {}) {
   process.umask(0o077);
+  const linkState = new FleetLinkState(config), link = linkState.load();
+  const linkMaterial = link ? linkState.materials(link.role) : undefined;
   const store = new Store(config.dataDir);
   const auth = new Auth(store, options.now);
   const sessions = new Sessions(store, config, options.tmux, options.codexControl);
@@ -45,6 +48,8 @@ export async function createApp(config: Config, options: { tmux?: TmuxRunner; no
   const app = Fastify({ ...serverOptions, ...(config.tls ? { serverFactory: (handler: import('node:http').RequestListener) => https.createServer({ key: fs.readFileSync(config.tls!.key), cert: fs.readFileSync(config.tls!.cert) }, handler) } : {}) });
   app.server.maxConnections = 128;
   app.server.maxHeadersCount = 64;
+  const privateFleet = link?.role === 'controller' ? new FleetPrivateListener(link, linkMaterial!, (req, res) => { app.server.emit('request', req, res); }) : undefined;
+  if (privateFleet) app.addHook('onReady', async () => { await privateFleet.start(); });
   // One exact upgrade dispatcher. No second listener can reject/consume an
   // already upgraded socket; unknown/query-string routes never allocate natives.
   const upgrade = (req: import('node:http').IncomingMessage, socket: import('node:stream').Duplex, head: Buffer) => {
@@ -193,9 +198,9 @@ export async function createApp(config: Config, options: { tmux?: TmuxRunner; no
   app.addHook('onClose', async () => {
     if (closed) return; closed = true;
     clearInterval(reconcileTimer); app.server.off('upgrade', upgrade);
-    await fleet?.close(); await telegram.close(); await bridges.close(); await desktop?.close(); await sessions.shutdown(); store.close();
+    await privateFleet?.close(); await fleet?.close(); await telegram.close(); await bridges.close(); await desktop?.close(); await sessions.shutdown(); store.close();
   });
   return { app, store, auth, sessions, bridges, telegram, fleet, desktop,
     stats: () => ({ pid: process.pid, uptime: process.uptime(), memory: process.memoryUsage(), bridges: bridges.stats(), sessions: sessions.stats(), auth: auth.stats(), telegram: telegram.stats(), fleet: fleet?.stats(), desktop: desktop?.stats() }),
-    close: async () => { await fleet?.close(); await telegram.close(); await bridges.close(); await desktop?.close(); await app.close(); } };
+    close: async () => { await privateFleet?.close(); await fleet?.close(); await telegram.close(); await bridges.close(); await desktop?.close(); await app.close(); } };
 }

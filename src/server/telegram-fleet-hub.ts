@@ -21,7 +21,7 @@ const pause = (ms: number, signal: AbortSignal) => new Promise<void>(resolve => 
 type Peer = { node: FleetNode; instance: string; seq: number; nextUpdate: number; busy: boolean; seen: number; registered: boolean;
   mailbox?: { value: Record<string, unknown>; at: number }; wake?: () => void;
   replies: Map<number, { date: number; expires: number }>; callbacks: Map<string, number> };
-type Runtime = { api: TelegramApi; abort: AbortController; lock: TelegramLock; epoch: string; cursor: number; ready: boolean; done: Promise<void> };
+type Runtime = { api: TelegramApi; poll: TelegramApi; abort: AbortController; lock: TelegramLock; epoch: string; cursor: number; ready: boolean; done: Promise<void> };
 type Job = { method: string; body: object; signal: AbortSignal; check: () => boolean; resolve: (x: unknown) => void; reject: (e: unknown) => void; cancelled: () => void };
 
 // A bounded Bot API multiplexer, NOT a generic API proxy or remote shell.
@@ -73,7 +73,7 @@ export class TelegramFleetHub {
     if (this.timer || this.closing || (this.config.testMode && !this.test)) return;
     this.timer = setInterval(() => void this.monitor(), 1000); this.timer.unref(); void this.monitor();
   }
-  private monitor() { return this.checking ??= this.check().catch(() => { this.status = 'unsafe_or_unavailable'; this.runtime?.abort.abort(); this.runtime?.api.close(); }).finally(() => {
+  private monitor() { return this.checking ??= this.check().catch(() => { this.status = 'unsafe_or_unavailable'; this.runtime?.abort.abort(); this.runtime?.api.close(); this.runtime?.poll.close(); }).finally(() => {
     this.checking = undefined;
     if (Date.now() >= this.nextStatus) {
       this.nextStatus = Date.now() + 10000;
@@ -84,22 +84,23 @@ export class TelegramFleetHub {
     let permitted = false;
     try { this.refresh(); permitted = this.state.control()?.enabled === true && sameBinding(currentBinding(this.state), this.fleet.binding); } catch { this.status = 'unsafe_or_revoked'; }
     const r = this.runtime;
-    if (r && (!permitted || this.closing || this.state.control()?.epoch !== r.epoch)) { r.abort.abort(); r.api.close(); this.resetPeers(); await r.done; }
+    if (r && (!permitted || this.closing || this.state.control()?.epoch !== r.epoch)) { r.abort.abort(); r.api.close(); r.poll.close(); this.resetPeers(); await r.done; }
     this.prune();
     if (!permitted || this.closing || this.runtime || Date.now() < this.retryAt) return;
     const lock = new TelegramLock(this.state.dir + '/poller');
     if (!await lock.acquire()) { this.status = 'poller_owned_elsewhere'; return; }
-    let api: TelegramApi | undefined;
+    let api: TelegramApi | undefined, poll: TelegramApi | undefined;
     try {
       const c = this.state.control(); if (!c?.enabled || this.closing) { await lock.close(); return; }
-      api = new TelegramApi(this.state.token(), this.test ? { testMode: true, endpoint: this.test.endpoint } : undefined);
-      const run: Runtime = { api, abort: new AbortController(), lock, epoch: c.epoch, cursor: this.state.cursor(c.epoch), ready: false, done: Promise.resolve() };
+      const token = this.state.token(), test = this.test ? { testMode: true, endpoint: this.test.endpoint } : undefined;
+      api = new TelegramApi(token, test); poll = new TelegramApi(token, test);
+      const run: Runtime = { api, poll, abort: new AbortController(), lock, epoch: c.epoch, cursor: this.state.cursor(c.epoch), ready: false, done: Promise.resolve() };
       this.runtime = run;
       run.done = this.run(run).catch(() => { this.status = 'offline'; this.retryAt = Date.now() + TG_LIMITS.maxBackoffMs; }).finally(async () => {
-        run.ready = false; run.abort.abort(); run.api.close(); this.resetPeers(); await this.draining; await lock.close();
+        run.ready = false; run.abort.abort(); run.api.close(); run.poll.close(); this.resetPeers(); await this.draining; await lock.close();
         if (this.runtime === run) this.runtime = undefined;
       });
-    } catch { api?.close(); await lock.close(); this.status = 'unavailable'; this.retryAt = Date.now() + 5000; }
+    } catch { api?.close(); poll?.close(); await lock.close(); this.status = 'unavailable'; this.retryAt = Date.now() + 5000; }
   }
   private resetPeers() {
     this.selected = undefined;
@@ -117,7 +118,7 @@ export class TelegramFleetHub {
   }
   private async run(r: Runtime) {
     await verifyBot(r.api, this.fleet.binding.bot, r.abort.signal);
-    const next = await discardBacklog(r.api, r.abort.signal);
+    const next = await discardBacklog(r.poll, r.abort.signal);
     if (r.abort.signal.aborted) return;
     r.cursor = next || r.cursor; this.state.claim(r.epoch, r.cursor); r.ready = true;
     let backoff = 300, menuAt = 0;
@@ -129,7 +130,10 @@ export class TelegramFleetHub {
           await this.schedule('setChatMenuButton', { chat_id: this.fleet.binding.owner.chatId, menu_button: { type: 'commands' } }, r.abort.signal);
           menuAt = Infinity;
         }
-        const batch = await updates({ call: (method, body, signal) => this.schedule(method, body, signal || r.abort.signal) as never, close() {} }, r.cursor, r.abort.signal);
+        // Exactly ONE poller, with its own single socket. Empty long polls must
+        // not hold the bounded outgoing lane hostage for three seconds. Sends
+        // and callback acknowledgements remain serialized and rate-limited.
+        const batch = await updates(r.poll, r.cursor, r.abort.signal);
         for (const update of batch) {
           const id = updateId(update)!; if (id < r.cursor) fail('invalid_response');
           // Claim durably BEFORE choosing or contacting any VPS. A failed link
@@ -149,6 +153,7 @@ export class TelegramFleetHub {
     }
   }
   private schedule(method: string, body: object, signal: AbortSignal, check = () => this.isReady()): Promise<unknown> {
+    if (method === 'getUpdates') return Promise.reject(new TelegramApiError('api_rejected'));
     if (!check() || signal.aborted) return Promise.reject(new TelegramApiError('aborted'));
     if (this.jobs.length >= FLEET_LIMITS.nodes + 1) return Promise.reject(new TelegramApiError('busy'));
     return new Promise((resolve, reject) => {
@@ -358,5 +363,5 @@ export class TelegramFleetHub {
   }
   stats() { return { role: 'controller', status: this.status, telegramPollers: this.runtime?.ready ? 1 : 0, queuedApiRequests: this.jobs.length,
     forwarded: this.forwarded, refused: this.refused, nodes: [...this.peers.values()].map(p => ({ id: p.node.id, label: p.node.label, online: this.online(p), mailboxes: p.mailbox ? 1 : 0, replies: p.replies.size, callbacks: p.callbacks.size, requests: p.busy ? 1 : 0 })) }; }
-  async close() { this.closing = true; if (this.timer) clearInterval(this.timer); this.timer = undefined; this.runtime?.abort.abort(); this.runtime?.api.close(); this.resetPeers(); await this.checking; await this.runtime?.done; await this.draining; }
+  async close() { this.closing = true; if (this.timer) clearInterval(this.timer); this.timer = undefined; this.runtime?.abort.abort(); this.runtime?.api.close(); this.runtime?.poll.close(); this.resetPeers(); await this.checking; await this.runtime?.done; await this.draining; }
 }

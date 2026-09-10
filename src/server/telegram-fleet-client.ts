@@ -4,6 +4,7 @@ import { randomBytes } from 'node:crypto';
 import type { Config } from './config.js';
 import { TelegramApiError, type TelegramTransport } from './telegram-api.js';
 import { FLEET_LIMITS, type FleetWorker } from './telegram-fleet-state.js';
+import { FleetLinkState, type FleetLink } from './telegram-fleet-link.js';
 
 // One bounded HTTPS connection to the pinned controller. Never talks to
 // api.telegram.org, reads a Telegram token, follows redirects or retries input.
@@ -15,10 +16,12 @@ export class FleetRemoteTransport implements TelegramTransport {
   private instance = randomBytes(16).toString('hex');
   private seq = 0;
   private url: URL;
+  private link?: FleetLink;
   constructor(private worker: FleetWorker, config: Config) {
     this.url = new URL(worker.controller);
     if (this.url.protocol !== 'https:' || this.url.origin !== worker.controller) throw new TelegramApiError('api_rejected');
-    const ca = config.testMode && config.tls && ['localhost', '127.0.0.1', '[::1]'].includes(this.url.hostname) ? fs.readFileSync(config.tls.cert) : undefined;
+    const state = new FleetLinkState(config); this.link = state.load('worker');
+    const ca = this.link ? state.materials('worker').cert : config.testMode && config.tls && ['localhost', '127.0.0.1', '[::1]'].includes(this.url.hostname) ? fs.readFileSync(config.tls.cert) : undefined;
     this.agent = new https.Agent({ keepAlive: true, maxSockets: 1, maxFreeSockets: 1, ...(ca ? { ca } : {}) });
   }
   call<T>(method: string, body: object, signal?: AbortSignal): Promise<T> {
@@ -33,9 +36,12 @@ export class FleetRemoteTransport implements TelegramTransport {
         clearTimeout(timer); signal?.removeEventListener('abort', abort); this.request = undefined;
         if (error) { this.healthy = false; reject(error); } else resolve(value!);
       };
-      const request = https.request({ protocol: 'https:', hostname: this.url.hostname.replace(/[\[\]]/g, ''), port: this.url.port || undefined,
+      const request = https.request({ protocol: 'https:', hostname: this.link?.address || this.url.hostname.replace(/[\[\]]/g, ''), port: this.link?.port || this.url.port || undefined,
+        // Private IP only changes the TCP destination, never authenticated TLS
+        // identity or HTTP Host. No cleartext/insecure/public fallback on error.
+        ...(this.link ? { servername: this.url.hostname, rejectUnauthorized: true } : {}),
         path: '/api/telegram-fleet', method: 'POST', agent: this.agent,
-        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(text),
+        headers: { Host: this.url.host, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(text),
           'X-PocketTerminal-Node': this.worker.node.id, Authorization: 'Bearer ' + this.worker.key },
       }, response => {
         const bytes = Buffer.allocUnsafe(FLEET_LIMITS.response); let used = 0;

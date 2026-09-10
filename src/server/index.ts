@@ -24,7 +24,8 @@ async function main() {
       process.send?.({ type: 'measurement', ...service.stats(), handles, ptyFds });
     }
   });
-  await service.app.listen({ host: config.host, port: config.port });
+  try { await service.app.listen({ host: config.host, port: config.port }); }
+  catch (error) { await service.close(); throw error; }
   process.stdout.write(JSON.stringify({ event: 'ready', pid: process.pid, bind: config.host, port: config.port, ownerInitialized: service.auth.initialized() }) + '\n');
 }
 main().catch(() => { process.stderr.write('{"event":"startup_failed","detail":"Check app state/schema/config; no destructive recovery attempted"}\n'); process.exitCode = 1; });

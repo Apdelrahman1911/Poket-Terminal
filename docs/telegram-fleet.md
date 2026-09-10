@@ -28,6 +28,12 @@ start/exit errors. Short transitions may be missed. There are no automatic
 transcripts, screen-text guesses or stored offline alerts. Shared Telegram
 rate-limiting can delay simultaneous alerts by a few seconds.
 
+The controller uses **one polling connection and one serialized outgoing
+connection**, not two pollers. An empty three-second Telegram long poll therefore
+does not block worker replies or callback acknowledgements. The outgoing queue
+and shared send-rate limit still apply; a private link cannot remove Telegram's
+own network delay or make a busy CLI finish faster.
+
 ## Configure the first/controller VPS
 
 First deploy this version and complete ordinary private Telegram pairing on
@@ -100,6 +106,68 @@ already-linked worker. Ordinary `telegram disable/revoke` remains an emergency
 local stop, preserving jobs. Changing the paired owner/bot on the controller
 fails closed against existing fleet pins; consciously relink for the new owner.
 
+## Optional encrypted private-network link
+
+Use this when a provider's public HTTPS proxy adds latency between VPSs. Default
+public HTTPS still works. Enabling private networking alone does **not** change
+the worker's route. This option uses a small additional TLS listener **inside the
+existing Node process**, bound only to a specific RFC1918 IPv4 address. There is
+no extra daemon, terminal renderer or PTY. It serves only fleet RPC and `/health`.
+
+1. Allow the worker to reach the controller over the provider's private network.
+   Choose an unused private TCP port, e.g. **3443**. Permit it only on that private
+   link/firewall; **do not expose it publicly**, add a preview URL, or change DNS.
+   Never use a provider's public outbound IP as a private destination.
+2. On the controller, in the app directory with its normal environment loaded,
+   create a **new, dedicated** certificate/key. Replace the example hostname with
+   the hostname of this controller's configured HTTPS origin. Never copy a
+   website key, bot token, owner password or Codex credentials to workers:
+
+   ```bash
+   set +x; umask 077
+   # .runtime/telegram is the existing owner-only 0700 Telegram directory.
+   # Refuse overwriting an existing key/certificate: renew deliberately instead.
+   test ! -e .runtime/telegram/fleet-tls-key.pem &&
+   test ! -e .runtime/telegram/fleet-tls-cert.pem &&
+   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+     -days 365 -subj '/CN=terminal.example.com' \
+     -addext 'subjectAltName=DNS:terminal.example.com' \
+     -keyout .runtime/telegram/fleet-tls-key.pem \
+     -out .runtime/telegram/fleet-tls-cert.pem
+   chmod 600 .runtime/telegram/fleet-tls-{key,cert}.pem
+   npm run fleet -- private 10.0.0.10 3443
+   # Confirm FLEET; reload ONLY the controller web backend.
+   ```
+
+3. Transfer **only the public certificate** `fleet-tls-cert.pem` over verified
+   SSH/SCP to each worker as `.runtime/telegram/fleet-controller-ca.pem`, owned
+   by that app's owner and mode `0600`. Do **not** transfer the private key.
+   On each worker, from its app directory/environment:
+
+   ```bash
+   chmod 600 .runtime/telegram/fleet-controller-ca.pem
+   npm run fleet -- private 10.0.0.10 3443
+   # Use the CONTROLLER private IP, not this worker's IP. Confirm FLEET.
+   # Reload ONLY this worker's web backend, then:
+   npm run fleet -- status
+   ```
+
+The private connection retains the controller's original hostname for **TLS
+certificate validation, SNI and HTTP Host**, while connecting directly to its
+private IP. The copied certificate is its dedicated trust anchor; ordinary
+certificate expiry/hostname/signature checks remain enabled. No TLS-verification
+bypass, redirects, plaintext mode or automatic public fallback exists. Existing
+unique worker credentials still authenticate every RPC. All-server alerts and
+exact VPS/session routing are unchanged.
+
+Renew the certificate **before its expiry**; distribute the new public certificate
+privately to the intended workers and coordinate web-only reloads. Preserve old
+files privately for rollback; never replay an uncertain terminal action.
+To deliberately revert to the normal public HTTPS route, run `npm run fleet --
+public` on each worker and reload it; then run the same command and reload on the
+controller to remove its private listener. Keys are not automatically deleted.
+Routing is local `fleet-link.json` metadata, not shared identity or SQLite data.
+
 ## Status, revocation and failures
 
 ```bash
@@ -143,9 +211,15 @@ for later offline execution. Reconnecting never retargets or replays that input.
   wrong Host, wrong-node keys and unrelated methods. It cannot authenticate
   normal browser APIs or act as a different worker.
 - At most eight nodes, one request and one <=64 KiB online handoff per node;
-  shared upstream queue <=9 requests, one upstream request at a time, private
+  shared outgoing queue <=9 requests, one outgoing request plus one independent
+  long poll (at most two upstream requests/sockets total), private
   sends paced >=1.05 seconds apart. RPC request/response caps 32/96 KiB, 20-second
   deadline. One keep-alive HTTPS socket per worker, no output-retaining outbox.
+- Optional private TLS: <=16 inbound sockets (including incomplete handshakes),
+  5-second handshake/header deadline, <=8 KiB headers, bounded request/idle
+  deadlines; no duplicate Fastify router or process. Private TLS files <=16 KiB
+  each, routing metadata <=4 KiB, owner-only/no symlinks. Listener sockets are
+  destroyed on shutdown; certificate failures never fall back to HTTP/public.
 - Per-node reply/callback routing metadata <=8 each, two-minute expiry. Existing
   local bot caps (64 actions, 8 replies, 20 observed IDs/notices) remain. Bodies
   die after the request. No terminal contents enter SQLite or private fleet files.
@@ -166,8 +240,11 @@ node --expose-gc --import tsx --test --test-concurrency=1 tests/telegram-fleet.t
 This uses five isolated app instances, fake Telegram, synthetic owner credentials
 and real disposable shell sessions: simultaneous notifications with no switching,
 cross-VPS replies/buttons, duplicate input refusal, endpoint isolation, six worker
-reconnect cycles and controller restart. It records heap/resource bounds in
-`.runtime/evidence/telegram-fleet.json`. No paid inference or owner job is used.
+reconnect cycles and controller restart. Also covers a real-duration synthetic
+long poll without reply blocking, private TLS hostname/CA rejection, route
+isolation and repeated private connection cleanup. It records heap/resource
+bounds in `.runtime/evidence/telegram-fleet.json` and polling contention latency
+in `.runtime/evidence/telegram-fleet-latency.json`. No paid inference or owner job is used.
 Short synthetic measurements are not a new prolonged production memory soak or
 a physical-phone test. Production rollout must separately preserve managed pane
 and desktop process identities and measure both live backend RSS values.

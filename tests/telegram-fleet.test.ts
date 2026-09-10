@@ -3,14 +3,118 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import https from 'node:https';
+import { rootCertificates } from 'node:tls';
 import { createApp } from '../src/server/app.js';
 import { FleetState, FleetLocalState, validateFleet, FLEET_LIMITS } from '../src/server/telegram-fleet-state.js';
 import { initializeFleet, addFleetWorker, joinFleet, removeFleetWorker } from '../src/server/telegram-fleet-setup.js';
 import { fleetRoute, TelegramFleetHub } from '../src/server/telegram-fleet-hub.js';
-import { testConfig, until, delay, cleanupTmux } from './helpers.js';
+import { FleetRemoteTransport } from '../src/server/telegram-fleet-client.js';
+import { FleetLinkState, validateFleetLink } from '../src/server/telegram-fleet-link.js';
+import { testConfig, until, delay, cleanupTmux, freePort } from './helpers.js';
 import { fakeTelegram, dummyState, message, OWNER, BOT_ID } from './telegram-fake.js';
 import { TelegramState } from '../src/server/telegram-state.js';
 process.umask(0o077);
+
+test('private fleet configuration refuses public/wildcard addresses and unsafe TLS files', async () => {
+  const config = await testConfig('fl-link-state'); dummyState(config, false);
+  const state = new FleetLinkState(config), valid = { version: 1, role: 'worker', address: '10.10.0.2', port: 3443 };
+  try {
+    assert.deepEqual(validateFleetLink(valid), valid);
+    for (const address of ['0.0.0.0', '8.8.8.8', '127.0.0.1', '10.0.0.999', 'private.example', '::1']) assert.throws(() => validateFleetLink({ ...valid, address }));
+    for (const port of [443, 0, 65536, '3443']) assert.throws(() => validateFleetLink({ ...valid, port }));
+    assert.throws(() => validateFleetLink({ ...valid, insecure: true }));
+    state.save(validateFleetLink(valid)); assert.deepEqual(state.load('worker'), valid); assert.throws(() => state.load('controller'));
+    assert.throws(() => state.materials('worker'));
+    const ca = path.join(state.dir, 'fleet-controller-ca.pem');
+    fs.copyFileSync(config.tls!.cert, ca); fs.chmodSync(ca, 0o600); assert(state.materials('worker').cert);
+    fs.chmodSync(ca, 0o644); assert.throws(() => state.materials('worker'));
+    fs.unlinkSync(ca); fs.symlinkSync(config.tls!.cert, ca); assert.throws(() => state.materials('worker'));
+    fs.unlinkSync(ca); fs.writeFileSync(ca, 'not a certificate', { mode: 0o600 }); assert.throws(() => state.materials('worker'));
+    state.save(undefined); assert.equal(state.load('worker'), undefined);
+  } finally { cleanupTmux(config); }
+});
+
+test('private TLS uses pinned CA plus original hostname/Host, isolates routes and cleans repeated connections', async () => {
+  const config = await testConfig('fl-private'), fake = await fakeTelegram(); dummyState(config, true);
+  await initializeFleet(config, 'Controller'); config.telegramFleet = new FleetState(config).load();
+  let grant: any; await addFleetWorker(config, 'Worker', x => { grant = x; });
+  const state = new FleetLinkState(config), port = await freePort();
+  for (const [source, name] of [[config.tls!.key, 'fleet-tls-key.pem'], [config.tls!.cert, 'fleet-tls-cert.pem']]) {
+    fs.copyFileSync(source!, path.join(state.dir, name!)); fs.chmodSync(path.join(state.dir, name!), 0o600);
+  }
+  state.save({ version: 1, role: 'controller', address: '127.0.0.1', port });
+  const worker = await testConfig('fl-private-w'); dummyState(worker, false); await joinFleet(worker, grant); worker.telegramFleet = new FleetState(worker).load();
+  const workerState = new FleetLinkState(worker), ca = path.join(workerState.dir, 'fleet-controller-ca.pem');
+  fs.copyFileSync(config.tls!.cert, ca); fs.chmodSync(ca, 0o600);
+  workerState.save({ version: 1, role: 'worker', address: '127.0.0.1', port });
+  const service = await createApp(config, { telegram: { endpoint: fake.endpoint } });
+  const transports: FleetRemoteTransport[] = [];
+  const client = (value = grant) => { const c = new FleetRemoteTransport(value, worker); transports.push(c); return c; };
+  const request = (url: string, headers: Record<string, string> = {}) => new Promise<number>((resolve, reject) => {
+    const req = https.request({ hostname: '127.0.0.1', port, servername: 'localhost', ca: fs.readFileSync(config.tls!.cert), agent: false,
+      path: url, method: 'POST', headers: { Host: new URL(config.origin).host, 'Content-Type': 'application/json', 'Content-Length': '2',
+        'X-PocketTerminal-Node': grant.node.id, Authorization: 'Bearer ' + grant.key, ...headers } }, res => { res.resume(); res.once('end', () => resolve(res.statusCode!)); });
+    req.on('error', reject); req.end('{}');
+  });
+  try {
+    await service.app.listen({ host: config.host, port: config.port }); await until(() => service.fleet!.isReady(), 6000);
+    for (let i = 0; i < 6; i++) {
+      const c = client(); assert.equal((await c.call<any>('getMe', {})).id, BOT_ID);
+      const poll = c.call('getUpdates', { offset: 0, limit: 1, timeout: 3, allowed_updates: ['message', 'callback_query'] });
+      const rejected = assert.rejects(poll);
+      await until(() => service.fleet!.stats().nodes.find(n => n.id === grant.node.id)?.requests === 1);
+      c.close(); await rejected;
+      await until(() => service.fleet!.stats().nodes.find(n => n.id === grant.node.id)?.requests === 0);
+    }
+    const c = client(); await c.call('getMe', {});
+    const result = await c.call<any>('sendMessage', { chat_id: OWNER, text: 'Private synthetic route', protect_content: true, link_preview_options: { is_disabled: true } });
+    assert.match(result.text, /Private synthetic route/); c.close();
+    assert.equal(await request('/api/sessions'), 404); assert.equal(await request('/api/login'), 404);
+    assert.equal(await request('/api/telegram-fleet', { Host: 'wrong.example' }), 401);
+    assert.equal(await request('/api/telegram-fleet', { cookie: 'anything' }), 401);
+    assert.equal(await request('/api/telegram-fleet', { Authorization: 'Bearer ' + 'a'.repeat(64) }), 401);
+    const wrongName = client({ ...grant, controller: 'https://wrong.invalid' }); await assert.rejects(wrongName.call('getMe', {})); wrongName.close();
+    fs.writeFileSync(ca, rootCertificates[0]!);
+    const wrongCA = client(); await assert.rejects(wrongCA.call('getMe', {})); wrongCA.close();
+    fs.copyFileSync(config.tls!.cert, ca);
+    await service.close();
+    let fallbacks = 0;
+    const fallback = https.createServer({ key: fs.readFileSync(config.tls!.key), cert: fs.readFileSync(config.tls!.cert) }, (_req, res) => { fallbacks++; res.end('{"ok":true,"result":{}}'); });
+    await new Promise<void>(resolve => fallback.listen(config.port, '127.0.0.1', resolve));
+    try {
+      await assert.rejects(client().call('getMe', {}), 'Private link must not silently fall back to reachable public HTTPS');
+      assert.equal(fallbacks, 0);
+    } finally { await new Promise<void>(resolve => fallback.close(() => resolve())); }
+  } finally { for (const c of transports) c.close(); await service.close(); cleanupTmux(config); cleanupTmux(worker); await fake.close(); }
+});
+
+test('an idle Telegram long poll never blocks a worker reply; both lanes stay bounded and close', async () => {
+  const config = await testConfig('fl-latency'), fake = await fakeTelegram();
+  dummyState(config, true); await initializeFleet(config, 'Controller');
+  let grant: any; await addFleetWorker(config, 'Worker', x => { grant = x; });
+  const hub = new TelegramFleetHub(config, new FleetState(config).load() as any, { endpoint: fake.endpoint }); hub.start();
+  try {
+    await until(() => hub.isReady() && fake.calls.some(c => c.method === 'setChatMenuButton'), 6000);
+    const signal = new AbortController().signal, instance = 'd'.repeat(32);
+    await hub.rpc(grant.node.id, { instance, seq: 1, method: 'getMe', body: {} }, signal);
+    // Real Telegram keeps an empty getUpdates request open for three seconds.
+    fake.delay = 3000;
+    const polls = fake.calls.filter(c => c.method === 'getUpdates').length;
+    await until(() => fake.calls.filter(c => c.method === 'getUpdates').length > polls && fake.activePolls === 1, 6000);
+    const started = performance.now();
+    await hub.rpc(grant.node.id, { instance, seq: 2, method: 'sendMessage', body: {
+      chat_id: OWNER, text: 'Synthetic latency probe', protect_content: true, link_preview_options: { is_disabled: true },
+    } }, signal);
+    const elapsedMs = performance.now() - started;
+    fs.mkdirSync(path.join(config.root, '.runtime/evidence'), { recursive: true });
+    fs.writeFileSync(path.join(config.root, '.runtime/evidence/telegram-fleet-latency.json'), JSON.stringify({ synthetic: true, pollDelayMs: 3000, replyMs: elapsedMs, maxPolls: fake.maxPolls, maxOutgoing: fake.maxOutgoing, maxActive: fake.maxActive }));
+    assert(elapsedMs < 800, `Worker reply waited ${Math.round(elapsedMs)}ms behind polling`);
+    assert.equal(fake.activePolls, 1, 'Sending must not abort/restart the long poll');
+    assert.equal(fake.maxPolls, 1); assert.equal(fake.maxOutgoing, 1); assert(fake.maxActive <= 2);
+  } finally {
+    await hub.close(); await until(() => fake.active === 0, 1500); cleanupTmux(config); await fake.close();
+  }
+});
 
 test('fleet liveness follows authenticated RPCs, not completed reverse-proxy HTTP hop closures', async () => {
   const config = await testConfig('fl-proxy'), fake = await fakeTelegram();
@@ -177,7 +281,9 @@ test('five VPSs share ONE bot: all-server alerts, exact-target replies/buttons, 
     services.forEach((s, i) => { s.sessions.describe = row => ({ ...originalDescriptions[i]!(row), activity: row.state === 'running' ? activity as any : 'not_reported' }); });
     await delay(5000); const beforeWave = last(); activity = 'awaiting_input';
     await until(() => [1, 2, 3, 4, 5].every(n => fake.sent.some(m => m.message_id > beforeWave && m.text.startsWith(`[VPS ${n}]`) && m.text.includes('Native Codex reports input/action required.'))), 18000, 'Alerts from all five servers without switching');
-    assert.equal(fake.maxActive, 1, 'All upstream Telegram requests are serialized');
+    assert.equal(fake.maxPolls, 1, 'Exactly one upstream poller');
+    assert.equal(fake.maxOutgoing, 1, 'Outgoing Telegram requests remain serialized');
+    assert(fake.maxActive <= 2, 'Only one poll plus one outgoing request');
     const wave = fake.sent.filter(m => m.message_id > beforeWave && m.text.includes('Native Codex reports input/action required.')).map(m => m.text.slice(0, 7));
     services.forEach((s, i) => { s.sessions.describe = originalDescriptions[i]!; });
 
@@ -215,11 +321,11 @@ test('five VPSs share ONE bot: all-server alerts, exact-target replies/buttons, 
     assert.equal(last(), beforeUnauthorized);
     const states = services.map(s => ({ bot: s.telegram.stats(), bridge: s.bridges.stats(), sessions: s.sessions.stats() }));
     assert(states.every(s => s.bridge.created === 0 && s.bridge.telegramInput.transientBuffers === 0));
-    assert.equal(fake.maxActive, 1);
+    assert.equal(fake.maxPolls, 1); assert.equal(fake.maxOutgoing, 1); assert(fake.maxActive <= 2);
     await removeFleetWorker(config, grants[3].node.id);
     await until(() => !hub.fleet!.stats().nodes.some(n => n.id === grants[3].node.id), 5000);
     assert.equal(services[4]!.sessions.get(rows[4]!.id).state, 'running');
-    const report = { synthetic: true, realTelegram: false, vpsCount: 5, notificationSourcesWithoutSwitching: wave, maxConcurrentUpstreamRequests: fake.maxActive,
+    const report = { synthetic: true, realTelegram: false, vpsCount: 5, notificationSourcesWithoutSwitching: wave, maxConcurrentUpstreamRequests: fake.maxActive, maxPolls: fake.maxPolls, maxOutgoing: fake.maxOutgoing,
       reconnectCycles: 6, controllerRestarts: 1, heapSamples, beforeDisconnect: process.memoryUsage(), fleet: hub.fleet!.stats(), nativeAttachmentsCreated: states.reduce((n, s) => n + s.bridge.created, 0), privateInputReplayed: false };
     for (const service of services.slice(1)) await service.close();
     await delay(100); (globalThis as { gc?: () => void }).gc?.();
