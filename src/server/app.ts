@@ -95,7 +95,6 @@ export async function createApp(config: Config, options: { tmux?: TmuxRunner; no
     try {
       assertValue(fleet && fleet.authorize(req.headers['x-pocketterminal-node'], req.headers.authorization), 401, 'fleet_authentication_required');
       const result = await fleet.rpc(req.headers['x-pocketterminal-node'] as string, req.body, abort.signal);
-      fleet.trackConnection(req.headers['x-pocketterminal-node'] as string, (req.body as { instance?: unknown }).instance, req.raw.socket);
       const value = { ok: true, result };
       assertValue(Buffer.byteLength(JSON.stringify(value)) <= FLEET_LIMITS.response, 503, 'fleet_response_limit');
       return value;

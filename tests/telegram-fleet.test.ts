@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import https from 'node:https';
 import { createApp } from '../src/server/app.js';
 import { FleetState, FleetLocalState, validateFleet, FLEET_LIMITS } from '../src/server/telegram-fleet-state.js';
 import { initializeFleet, addFleetWorker, joinFleet, removeFleetWorker } from '../src/server/telegram-fleet-setup.js';
@@ -10,6 +11,44 @@ import { testConfig, until, delay, cleanupTmux } from './helpers.js';
 import { fakeTelegram, dummyState, message, OWNER, BOT_ID } from './telegram-fake.js';
 import { TelegramState } from '../src/server/telegram-state.js';
 process.umask(0o077);
+
+test('fleet liveness follows authenticated RPCs, not completed reverse-proxy HTTP hop closures', async () => {
+  const config = await testConfig('fl-proxy'), fake = await fakeTelegram();
+  dummyState(config, true); await initializeFleet(config, 'Controller');
+  let grant: any; await addFleetWorker(config, 'Worker', x => { grant = x; });
+  config.telegramFleet = new FleetState(config).load();
+  const service = await createApp(config, { telegram: { endpoint: fake.endpoint } });
+  const instance = 'c'.repeat(32); let seq = 0;
+  const rpc = (method: string, body: object) => {
+    let request: import('node:http').ClientRequest;
+    const done = new Promise<void>((resolve, reject) => {
+      const data = JSON.stringify({ instance, seq: ++seq, method, body });
+      // A fresh, explicitly closed HTTP hop models normal proxy pool churn.
+      request = https.request(new URL('/api/telegram-fleet', config.origin), { method: 'POST', agent: false, ca: fs.readFileSync(config.tls!.cert),
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data), Connection: 'close',
+          'X-PocketTerminal-Node': grant.node.id, Authorization: 'Bearer ' + grant.key } }, response => {
+        response.resume(); response.once('end', () => response.statusCode === 200 ? resolve() : reject(new Error('RPC refused')));
+      });
+      request.on('error', reject); request.end(data);
+    });
+    return { done, abort: () => request.destroy() };
+  };
+  const peer = () => service.fleet!.stats().nodes.find(n => n.id === grant.node.id)!;
+  try {
+    await service.app.listen({ host: config.host, port: config.port });
+    await until(() => service.fleet!.isReady(), 6000);
+    await rpc('getMe', {}).done;
+    const poll = { offset: 0, limit: 1, timeout: 0, allowed_updates: ['message', 'callback_query'] };
+    for (let i = 0; i < 4; i++) {
+      await rpc('getUpdates', poll).done; await delay(30);
+      assert.equal(peer().online, true, 'Completed proxy-hop closure must not mark a healthy worker offline');
+    }
+    const active = rpc('getUpdates', { ...poll, timeout: 3 });
+    const aborted = assert.rejects(active.done);
+    await until(() => peer().requests === 1); active.abort(); await aborted;
+    await until(() => !peer().online && peer().requests === 0, 5000, 'Aborted in-flight RPC must detach promptly');
+  } finally { await service.close(); cleanupTmux(config); await fake.close(); }
+});
 
 test('fleet RPC rejects duplicate sequences, arbitrary methods, concurrent peer requests and revoked credentials', async () => {
   const config = await testConfig('fl-rpc'), fake = await fakeTelegram();
@@ -146,6 +185,7 @@ test('five VPSs share ONE bot: all-server alerts, exact-target replies/buttons, 
     // state cannot cause a second upstream poller or duplicate input delivery.
     const heapSamples: number[] = [];
     for (let cycle = 0; cycle < 6; cycle++) {
+      await until(() => hub.fleet!.stats().nodes.find(n => n.id === grants[3].node.id)?.requests === 1, 6000);
       await services[4]!.close();
       await until(() => !hub.fleet!.stats().nodes.find(n => n.id === grants[3].node.id)?.online, 5000);
       services[4] = await createApp(configs[4]!, { telegram: { endpoint: fake.endpoint } });

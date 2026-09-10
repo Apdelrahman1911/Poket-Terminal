@@ -117,8 +117,10 @@ with a new ID/key if replacing a VPS. Do not hand-edit IDs to retarget old butto
 The controller is a single Telegram control point, not automatic high availability.
 If it fails, Telegram controls/alerts pause for all VPSs, while each website,
 tmux session and Codex job keeps running. Links reconnect with fresh transport
-instances; backoff can be up to 60 seconds. Normal socket closure marks a worker
-offline promptly; undetected partitions use a 30-second liveness window.
+instances; backoff can be up to 60 seconds. An aborted in-flight RPC marks its
+worker offline promptly; idle disconnects/undetected partitions use a 30-second
+liveness window. Closing a completed reverse-proxy HTTP hop is not evidence that
+the worker disconnected: proxies may close or reuse upstream sockets normally.
 
 No root action or outgoing message is automatically retried. A connection failure
 may lose an action or its receipt; an already-delivered action may have committed.

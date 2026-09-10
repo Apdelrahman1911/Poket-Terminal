@@ -20,7 +20,6 @@ const pause = (ms: number, signal: AbortSignal) => new Promise<void>(resolve => 
 });
 type Peer = { node: FleetNode; instance: string; seq: number; nextUpdate: number; busy: boolean; seen: number; registered: boolean;
   mailbox?: { value: Record<string, unknown>; at: number }; wake?: () => void;
-  link?: { socket: import('node:net').Socket; closed: () => void };
   replies: Map<number, { date: number; expires: number }>; callbacks: Map<string, number> };
 type Runtime = { api: TelegramApi; abort: AbortController; lock: TelegramLock; epoch: string; cursor: number; ready: boolean; done: Promise<void> };
 type Job = { method: string; body: object; signal: AbortSignal; check: () => boolean; resolve: (x: unknown) => void; reject: (e: unknown) => void; cancelled: () => void };
@@ -56,7 +55,6 @@ export class TelegramFleetHub {
     for (const [id, peer] of this.peers) {
       const node = nodes.find(n => n.id === id);
       if (!node || (id !== next.local.id && prior.workers.find(n => n.id === id)?.key !== next.workers.find(n => n.id === id)?.key)) {
-        if (peer.link) peer.link.socket.off('close', peer.link.closed); peer.link = undefined;
         peer.registered = false; peer.mailbox = undefined; peer.wake?.(); peer.replies.clear(); peer.callbacks.clear(); this.peers.delete(id);
       } else peer.node = { id: node.id, label: node.label };
     }
@@ -106,7 +104,6 @@ export class TelegramFleetHub {
   private resetPeers() {
     this.selected = undefined;
     for (const p of this.peers.values()) {
-      if (p.link) p.link.socket.off('close', p.link.closed); p.link = undefined;
       p.registered = false; p.seen = 0; p.mailbox = undefined; p.wake?.(); p.replies.clear(); p.callbacks.clear();
     }
     for (const job of this.jobs.splice(0)) { job.signal.removeEventListener('abort', job.cancelled); job.reject(new TelegramApiError('aborted')); }
@@ -191,16 +188,11 @@ export class TelegramFleetHub {
     } catch { return false; }
   }
   private validPeer(p: Peer, instance: string) { return this.isReady() && this.peers.get(p.node.id) === p && p.instance === instance; }
-  trackConnection(id: string, instance: unknown, socket: import('node:net').Socket) {
-    const p = this.peers.get(id);
-    if (!p || p.instance !== instance || p.link?.socket === socket) return;
-    if (p.link) p.link.socket.off('close', p.link.closed);
-    const closed = () => {
-      if (p.link?.socket !== socket) return;
-      p.link = undefined; p.registered = false; p.seen = 0; p.mailbox = undefined; p.wake?.();
-    };
-    p.link = { socket, closed }; socket.once('close', closed); if (socket.destroyed) closed();
-  }
+  // A reverse proxy's upstream socket is not a worker's end-to-end connection:
+  // it may close/reuse that hop after a successful RPC while the worker remains
+  // healthy. Use authenticated RPC liveness instead. An ABORTED active request
+  // still marks the peer offline immediately through its request-scoped signal;
+  // idle disconnects/undetected partitions expire after the bounded 30s window.
   async rpc(id: string, input: unknown, signal: AbortSignal): Promise<unknown> {
     this.refresh();
     if (!this.isReady() || signal.aborted || !fleetRecord(input) || !exactKeys(input, ['instance', 'seq', 'method', 'body'])
