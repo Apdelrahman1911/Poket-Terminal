@@ -43,6 +43,7 @@ async function main() {
     process.stdout.write(`Telegram DISABLED${mode === 'revoke' ? '; binding revoked' : ''}. Service cancels polling/pending actions and releases control within one second; already-committed effects may have occurred. Jobs are NOT stopped.\n`);
     return;
   }
+  if (config.telegramFleet?.role === 'worker') throw new Error('Fleet workers must not pair/poll the shared bot. Use fleet enable after linking, or telegram disable/revoke.');
   const endpoint = process.env.PT_TEST_TELEGRAM_API;
   if (config.testMode && !endpoint) throw new Error('Test setup requires a loopback fake Telegram API.');
   if (endpoint && !config.testMode) throw new Error('Fake Telegram API requires isolated test mode.');

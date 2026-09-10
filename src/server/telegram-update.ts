@@ -15,11 +15,11 @@ export function userMessage(update: Record<string, unknown>): Message | undefine
   if (Object.keys(update).some(k => k !== 'update_id' && k !== 'message') || !privateMessage(update.message)) return;
   return update.message;
 }
-export function callback(update: Record<string, unknown>, botId: number): Callback | undefined {
+export function callback(update: Record<string, unknown>, botId: number, acceptData?: (data: string) => boolean): Callback | undefined {
   if (Object.keys(update).some(k => k !== 'update_id' && k !== 'callback_query')) return;
   const c = update.callback_query;
   if (!object(c) || !object(c.from) || !numericId(c.from.id) || c.from.is_bot !== false || !privateMessage(c.message, true) || c.message.from.id !== botId || 'inline_message_id' in c) return;
-  if (typeof c.id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(c.id) || typeof c.data !== 'string' || (!/^p:[A-Za-z0-9_-]{22}$/.test(c.data) && !parseNavigation(c.data))) return;
+  if (typeof c.id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(c.id) || typeof c.data !== 'string' || (acceptData ? !acceptData(c.data) : (!/^p:[A-Za-z0-9_-]{22}$/.test(c.data) && !parseNavigation(c.data)))) return;
   return c as unknown as Callback;
 }
 export function fresh(date: number, now: number, maxAgeMs: number) { return date * 1000 >= now - maxAgeMs && date * 1000 <= now + 5000; }

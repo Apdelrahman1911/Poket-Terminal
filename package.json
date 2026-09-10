@@ -15,6 +15,7 @@
     "test:restart-ui": "playwright test -c playwright.restart-ui.config.ts",
     "password": "node dist/server/password.js",
     "telegram": "node dist/server/telegram-cli.js",
+    "fleet": "node dist/server/telegram-fleet-cli.js",
     "start": "./scripts/service.sh",
     "backup": "node dist/server/backup.js",
     "bench": "tsx scripts/benchmark.ts",

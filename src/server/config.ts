@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { desktopOptIn } from './desktop-opt-in.js';
+import { readFleet, type FleetConfig } from './telegram-fleet-state.js';
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 export const LIMITS = Object.freeze({ sessions: 20, attachments: 32, scrollback: 500, history: 2000,
@@ -58,6 +59,7 @@ export interface Config {
   tmuxSocket: string; projectRoot: string; defaultCwd: string; shell: string;
   testMode: boolean; tls?: { key: string; cert: string }; ackMs: number;
   codexArgs?: readonly string[]; sshTarget?: string; sshJump?: string; telegramBot?: TelegramBotIdentity;
+  telegramFleet?: FleetConfig;
   desktop?: { assetsDir: string; socketPath: string; uid: number; startCommand: 'start' | 'test-start'; autoStart?: boolean };
 }
 export function sshHint(config: Config, tmuxName: string) {
@@ -95,6 +97,13 @@ export function configFromEnv(env = process.env): Config {
     if (!uid) throw new Error('Desktop requires a provisioned non-root account');
     desktop = { assetsDir, socketPath: '/run/' + name + '/rfb.sock', uid, startCommand: testMode ? 'test-start' : 'start', autoStart: !testMode && optIn.autoStart };
   }
-  return { root: ROOT, dataDir, origin, host, port, tmuxSocket, projectRoot, defaultCwd, shell: '/bin/bash', testMode, tls, ackMs: LIMITS.ackMs,
+  const config: Config = { root: ROOT, dataDir, origin, host, port, tmuxSocket, projectRoot, defaultCwd, shell: '/bin/bash', testMode, tls, ackMs: LIMITS.ackMs,
     desktop, codexArgs: codexArgs(env), sshTarget, sshJump, telegramBot: telegramBotFromEnv(env) };
+  config.telegramFleet = readFleet(config);
+  if (config.telegramFleet) {
+    const pin = config.telegramFleet.binding.bot;
+    if (config.telegramBot && (config.telegramBot.id !== pin.id || config.telegramBot.username !== pin.username)) throw new Error('Fleet bot identity does not match configured pins');
+    config.telegramBot = pin;
+  }
+  return config;
 }

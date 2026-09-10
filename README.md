@@ -28,7 +28,7 @@ Codex configuration, domain configuration or prebuilt binary is included.
 - `deploy/`: ordinary Caddy and systemd examples; **no provider-specific boot API**.
 - `docs/`: [operations](docs/OPERATIONS.md), [security](docs/SECURITY.md),
   [protocol](docs/PROTOCOL.md), [copy/status](docs/copy-status.md),
-  [Telegram](docs/telegram.md). Desktop has its own
+  [Telegram](docs/telegram.md), [one bot for multiple VPSs](docs/telegram-fleet.md). Desktop has its own
   [setup](desktop/DEPLOYMENT.md) and [limits](desktop/SECURITY_AND_BOUNDS.md).
 
 ## Fresh VPS installation (ordered)
@@ -358,6 +358,10 @@ control.** Do not send credentials. Full steps: [docs/telegram.md](docs/telegram
    privately reverifies it. Bot identity/legacy-state changes require **revoke →
    update pins/token → supervisor restart → re-pair**, not an env-only switch.
    Old commands/confirmations are never replayed; real device acceptance is yours.
+
+For **one bot controlling several VPSs**, follow [fleet setup](docs/telegram-fleet.md)
+instead of pairing the same token on each host. `/servers` changes the command
+target; **notifications keep arriving from every linked VPS** with clear labels.
 
 ## Optional private desktop
 

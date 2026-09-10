@@ -70,7 +70,7 @@ export class TelegramState {
   private check(st: fs.Stats, limit: number) {
     if (!st.isFile() || st.uid !== process.geteuid?.() || (st.mode & 0o777) !== 0o600 || st.nlink !== 1 || st.size > limit) throw new TelegramStateError();
   }
-  private read(name: string, limit = 4096): string | undefined {
+  protected read(name: string, limit = 4096): string | undefined {
     // Absent installation does not create files or touch the token.
     if (!fs.existsSync(this.dir)) return undefined;
     this.directory();
@@ -88,12 +88,12 @@ export class TelegramState {
       return value.subarray(0, used).toString('utf8');
     } finally { fs.closeSync(fd); }
   }
-  private json(name: string): unknown {
+  protected json(name: string): unknown {
     const text = this.read(name);
     if (text === undefined) return undefined;
     try { return JSON.parse(text); } catch { throw new TelegramStateError(); }
   }
-  private write(name: string, value: unknown) {
+  protected write(name: string, value: unknown) {
     this.directory(true);
     const file = path.join(this.dir, name), text = JSON.stringify(value) + '\n';
     if (Buffer.byteLength(text) > 4096) throw new TelegramStateError();

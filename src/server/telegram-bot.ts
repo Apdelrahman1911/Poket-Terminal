@@ -17,6 +17,7 @@ interface Bound {
 interface Entry extends Bound { expires: number; messageId: number; date: number }
 type Button = { text: string; bound: Bound } | { text: string; url: string };
 interface Runtime { control: TelegramControl; api: TelegramTransport; abort: AbortController; lock: TelegramLock; done: Promise<void>; cursor: number }
+export interface TelegramDriver { state?: TelegramState; factory: () => TelegramTransport; lockName?: 'fleet-local'; enabled?: () => boolean; runtimeValid?: (api: TelegramTransport) => boolean }
 type Observation = { lifecycle: string; activity: string; createdAt: number };
 type Notice = 'stopped' | 'exited' | 'error' | 'awaiting_input' | 'ready';
 export function telegramCommand(text: string, botUsername: string) {
@@ -56,6 +57,7 @@ export class TelegramBot {
   private sleeper?: NodeJS.Timeout;
   private closing = false;
   private retryAt = 0;
+  private fleetStartupBackoff = 1000;
   private actions = new Map<string, Entry>();
   private replies = new Map<number, Entry>();
   private baseline = new Map<string, Observation>();
@@ -71,11 +73,11 @@ export class TelegramBot {
   private rejected = 0;
   private now: () => number;
   private supported: boolean;
-  constructor(private sessions: Sessions, private bridges: Bridges, private config: Config, private test?: { endpoint: string; now?: () => number }) {
+  constructor(private sessions: Sessions, private bridges: Bridges, private config: Config, private test?: { endpoint: string; now?: () => number }, private driver?: TelegramDriver) {
     if (test && !config.testMode) throw new Error('Telegram fake transport requires isolated test mode');
     this.now = test?.now || Date.now;
     this.supported = !config.testMode || !!test;
-    this.state = new TelegramState(config);
+    this.state = driver?.state || new TelegramState(config);
   }
   start() {
     if (!this.supported || this.timer || this.closing) return;
@@ -83,7 +85,7 @@ export class TelegramBot {
     void this.monitor();
   }
   private enabled(runtime: Runtime) {
-    if (this.closing || runtime.abort.signal.aborted) return false;
+    if (this.closing || runtime.abort.signal.aborted || this.driver?.enabled?.() === false || this.driver?.runtimeValid?.(runtime.api) === false) return false;
     try {
       const c = this.state.control();
       return !!c?.enabled && c.epoch === runtime.control.epoch && c.botId === runtime.control.botId && c.botUsername === runtime.control.botUsername && c.owner?.chatId === runtime.control.owner?.chatId && c.owner?.userId === runtime.control.owner?.userId
@@ -104,7 +106,7 @@ export class TelegramBot {
     if (!control?.enabled) {
       if (control || this.status !== 'unsafe_state') this.status = control?.owner ? 'disabled' : 'unpaired';
       if (!this.cleanedStartup && this.now() >= this.retryAt) {
-        const lock = new TelegramLock(this.state.dir + '/poller');
+        const lock = new TelegramLock(this.state.dir + '/' + (this.driver?.lockName || 'poller'));
         try {
           if (await lock.acquire()) { await this.bridges.telegramStartup(); this.cleanedStartup = true; }
         } catch { this.retryAt = this.now() + TG_LIMITS.maxBackoffMs; }
@@ -113,16 +115,20 @@ export class TelegramBot {
       return;
     }
     if (this.runtime || this.closing || this.now() < this.retryAt) return;
-    const lock = new TelegramLock(this.state.dir + '/poller');
+    if (this.driver?.enabled?.() === false) { this.status = 'fleet_controller_unavailable'; return; }
+    const lock = new TelegramLock(this.state.dir + '/' + (this.driver?.lockName || 'poller'));
     let api: TelegramTransport | undefined;
     try {
       if (!await lock.acquire()) { this.status = 'poller_owned_elsewhere'; return; }
       if (this.closing || this.state.control()?.epoch !== control.epoch || !this.state.control()?.enabled) { await lock.close(); return; }
       const cursor = this.state.cursor(control.epoch); this.notifications = this.state.notifications(control.epoch);
-      api = new TelegramApi(this.state.token(), this.test ? { testMode: true, endpoint: this.test.endpoint } : undefined);
+      api = this.driver ? this.driver.factory() : new TelegramApi(this.state.token(), this.test ? { testMode: true, endpoint: this.test.endpoint } : undefined);
       const runtime: Runtime = { control, cursor, api, abort: new AbortController(), lock, done: Promise.resolve() };
       this.runtime = runtime; this.status = 'starting';
-      runtime.done = this.run(runtime).catch(() => { this.status = 'unavailable'; this.retryAt = this.now() + TG_LIMITS.maxBackoffMs; }).finally(async () => {
+      runtime.done = this.run(runtime).catch(() => {
+        this.status = 'unavailable'; this.retryAt = this.now() + (this.driver ? this.fleetStartupBackoff : TG_LIMITS.maxBackoffMs);
+        this.fleetStartupBackoff = Math.min(TG_LIMITS.maxBackoffMs, this.fleetStartupBackoff * 2);
+      }).finally(async () => {
         runtime.abort.abort(); runtime.api.close();
         this.actions.clear(); this.replies.clear(); this.baseline.clear(); this.pending.clear(); this.baselineReady = false;
         await this.bridges.releaseTelegram(); await lock.close();
@@ -148,6 +154,7 @@ export class TelegramBot {
     // Telegram may randomize update IDs after a week idle. A nonempty -1 result
     // is a new confirmed backlog boundary, not a replay opportunity.
     const boundary = next || r.cursor; this.state.claim(r.control.epoch, boundary); r.cursor = boundary;
+    this.fleetStartupBackoff = 1000;
     this.baselineReady = false; this.nextReconcile = 0;
     let backoff = TG_LIMITS.intervalMs as number, menuRetryAt = 0, menuReady = false;
     while (this.enabled(r)) {

@@ -4,6 +4,10 @@
 controlling the paired private Telegram account can operate root terminals. Do
 not send passwords, keys or provider secrets. An outage does not stop web/jobs.
 
+For **one bot across several VPSs**, use [Telegram fleet setup](telegram-fleet.md).
+Only the controller polls Telegram; all linked VPSs notify independently of the
+selected server. Do not independently pair the shared bot on each worker.
+
 ## Create a bot and install its token privately
 
 Use Telegram's official **@BotFather** to create your own bot. Set **both**

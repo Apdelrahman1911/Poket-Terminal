@@ -10,6 +10,11 @@ import { Sessions, TerminalRow, TmuxRunner } from './sessions.js';
 import { Bridges, requestOriginAllowed } from './bridge.js';
 import { assertValue, HttpError } from './errors.js';
 import { TelegramBot } from './telegram-bot.js';
+import { TelegramApiError } from './telegram-api.js';
+import { TelegramState } from './telegram-state.js';
+import { TelegramFleetHub } from './telegram-fleet-hub.js';
+import { FleetRemoteTransport } from './telegram-fleet-client.js';
+import { FLEET_LIMITS, FleetState, FleetLocalState, sameBinding, currentBinding } from './telegram-fleet-state.js';
 import { Desktop } from './desktop.js';
 import type { NativeRunner } from './native-input.js';
 import type { CodexControl } from './codex-control.js';
@@ -22,7 +27,19 @@ export async function createApp(config: Config, options: { tmux?: TmuxRunner; no
   try { await sessions.initialize(); } catch (e) { store.close(); throw e; }
   const bridges = new Bridges(auth, sessions, config, options.nativeRunner);
   const desktop = config.desktop ? new Desktop(auth, config) : undefined;
-  const telegram = new TelegramBot(sessions, bridges, config, options.telegram);
+  const fleetConfig = config.telegramFleet;
+  const fleet = fleetConfig?.role === 'controller' ? new TelegramFleetHub(config, fleetConfig, options.telegram) : undefined;
+  const workerEnabled = () => {
+    try {
+      const current = new FleetState(config).load();
+      return fleetConfig?.role === 'worker' && current?.role === 'worker' && current.node.id === fleetConfig.node.id && current.key === fleetConfig.key
+        && current.controller === fleetConfig.controller && sameBinding(current.binding, fleetConfig.binding) && sameBinding(currentBinding(new TelegramState(config)), fleetConfig.binding);
+    } catch { return false; }
+  };
+  const telegram = new TelegramBot(sessions, bridges, config, options.telegram, fleet ? {
+    state: new FleetLocalState(config), factory: () => fleet.localTransport(), lockName: 'fleet-local', enabled: () => fleet.isReady(),
+  } : fleetConfig?.role === 'worker' ? { factory: () => new FleetRemoteTransport(fleetConfig, config), enabled: workerEnabled,
+    runtimeValid: api => api instanceof FleetRemoteTransport && api.healthy } : undefined);
   const serverOptions = { ajv: { customOptions: { removeAdditional: false, coerceTypes: false } }, logger: false as const, trustProxy: false as const, bodyLimit: 2048, requestTimeout: 10000, connectionTimeout: 15000, keepAliveTimeout: 5000,
     maxRequestsPerSocket: 1000, onProtoPoisoning: 'error' as const, onConstructorPoisoning: 'error' as const };
   const app = Fastify({ ...serverOptions, ...(config.tls ? { serverFactory: (handler: import('node:http').RequestListener) => https.createServer({ key: fs.readFileSync(config.tls!.key), cert: fs.readFileSync(config.tls!.cert) }, handler) } : {}) });
@@ -43,6 +60,14 @@ export async function createApp(config: Config, options: { tmux?: TmuxRunner; no
       'Permissions-Policy': 'camera=(), microphone=(), geolocation=(), clipboard-read=(self), clipboard-write=(self)',
       'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'" });
     if (req.url === '/health' && req.method === 'GET') return;
+    if (req.url === '/api/telegram-fleet' && req.method === 'POST') {
+      // A distinct machine-credential boundary. Cookies, browser Origin and
+      // Fetch Metadata never authenticate fleet traffic. No generic API bypass.
+      assertValue(!!fleet && requestOriginAllowed(req.raw, config.origin) && req.headers.origin === undefined && req.headers.cookie === undefined
+        && req.headers['sec-fetch-site'] === undefined && (req.headers['content-type'] || '').split(';')[0] === 'application/json'
+        && fleet.authorize(req.headers['x-pocketterminal-node'], req.headers.authorization), 401, 'fleet_authentication_required');
+      return;
+    }
     const write = !['GET', 'HEAD'].includes(req.method);
     assertValue(requestOriginAllowed(req.raw, config.origin, write), 403, 'origin_rejected');
     if (write) assertValue((req.headers['content-type'] || '').split(';')[0] === 'application/json', 415, 'json_required');
@@ -64,6 +89,21 @@ export async function createApp(config: Config, options: { tmux?: TmuxRunner; no
   const present = (row: TerminalRow) => ({ ...row, ...sessions.describe(row),
     ssh: sshHint(config, row.tmux_name) });
   app.get('/health', async () => ({ ok: true }));
+  app.post('/api/telegram-fleet', { bodyLimit: FLEET_LIMITS.request }, async (req, reply) => {
+    const abort = new AbortController();
+    const closed = () => abort.abort(); reply.raw.once('close', closed);
+    try {
+      assertValue(fleet && fleet.authorize(req.headers['x-pocketterminal-node'], req.headers.authorization), 401, 'fleet_authentication_required');
+      const result = await fleet.rpc(req.headers['x-pocketterminal-node'] as string, req.body, abort.signal);
+      fleet.trackConnection(req.headers['x-pocketterminal-node'] as string, (req.body as { instance?: unknown }).instance, req.raw.socket);
+      const value = { ok: true, result };
+      assertValue(Buffer.byteLength(JSON.stringify(value)) <= FLEET_LIMITS.response, 503, 'fleet_response_limit');
+      return value;
+    } catch (error) {
+      if (error instanceof TelegramApiError) throw new HttpError(error.code === 'busy' ? 409 : 503, 'fleet_unavailable_or_uncertain');
+      throw error;
+    } finally { reply.raw.off('close', closed); }
+  });
   app.get('/api/auth', async req => {
     const raw = cookieToken(req.headers.cookie), record = auth.authenticate(raw);
     return record ? { authenticated: true, csrf: csrfFor(raw!), expiresAt: record.expires_at, defaultCwd: config.defaultCwd, desktop: !!desktop } : { authenticated: false, setupRequired: !auth.initialized() };
@@ -146,7 +186,7 @@ export async function createApp(config: Config, options: { tmux?: TmuxRunner; no
   });
   const reconcileTimer = setInterval(() => { void sessions.reconcile().catch(() => { /* bounded retry at next tick; never dump command output */ }); }, 30000);
   reconcileTimer.unref();
-  telegram.start();
+  fleet?.start(); telegram.start();
   // Explicit root-owned opt-in only, no provider/boot configuration change.
   // Failure has no effect on terminal/Telegram startup and no automatic retry loop.
   if (config.desktop?.autoStart) void desktop!.start().catch(() => {});
@@ -154,9 +194,9 @@ export async function createApp(config: Config, options: { tmux?: TmuxRunner; no
   app.addHook('onClose', async () => {
     if (closed) return; closed = true;
     clearInterval(reconcileTimer); app.server.off('upgrade', upgrade);
-    await telegram.close(); await bridges.close(); await desktop?.close(); await sessions.shutdown(); store.close();
+    await fleet?.close(); await telegram.close(); await bridges.close(); await desktop?.close(); await sessions.shutdown(); store.close();
   });
-  return { app, store, auth, sessions, bridges, telegram, desktop,
-    stats: () => ({ pid: process.pid, uptime: process.uptime(), memory: process.memoryUsage(), bridges: bridges.stats(), sessions: sessions.stats(), auth: auth.stats(), telegram: telegram.stats(), desktop: desktop?.stats() }),
-    close: async () => { await telegram.close(); await bridges.close(); await desktop?.close(); await app.close(); } };
+  return { app, store, auth, sessions, bridges, telegram, fleet, desktop,
+    stats: () => ({ pid: process.pid, uptime: process.uptime(), memory: process.memoryUsage(), bridges: bridges.stats(), sessions: sessions.stats(), auth: auth.stats(), telegram: telegram.stats(), fleet: fleet?.stats(), desktop: desktop?.stats() }),
+    close: async () => { await fleet?.close(); await telegram.close(); await bridges.close(); await desktop?.close(); await app.close(); } };
 }
