@@ -7,6 +7,7 @@ import { Store } from './db.js';
 import { CODEX_ARGS, Config, LIMITS } from './config.js';
 import { assertValue, HttpError } from './errors.js';
 import { ACTIVITY_FORMAT, ACTIVITY_OPTION, ACTIVITY_VERSION, Activity, activity } from './status.js';
+import { CODEX_THREAD_ID, CodexControl, codexControl } from './codex-control.js';
 const exec = promisify(execFile);
 export interface TerminalRow {
   id: string; tmux_name: string; label: string; kind: 'codex' | 'shell'; cwd: string;
@@ -16,14 +17,17 @@ export type TmuxRunner = (args: string[]) => Promise<string>;
 const idPattern = /^[a-f0-9]{32}$/;
 export class Sessions {
   readonly tmux: TmuxRunner;
-  private busy = new Map<string, 'starting' | 'stopping' | 'deleting'>();
+  private busy = new Map<string, 'starting' | 'stopping' | 'deleting' | 'restarting'>();
+  private restarting = false;
+  private codex: CodexControl;
   private activities = new Map<string, Activity>();
   private observedAt = 0;
   private snapshots = 0;
   private reconciling?: Promise<void>;
   private stopped = false;
   private mutations = 0;
-  constructor(readonly store: Store, readonly config: Config, runner?: TmuxRunner) {
+  constructor(readonly store: Store, readonly config: Config, runner?: TmuxRunner, codex?: CodexControl) {
+    this.codex = codex || codexControl(config.root);
     this.tmux = runner || (async args => {
       const { stdout } = await exec('tmux', ['-L', config.tmuxSocket, ...args], { timeout: 5000, maxBuffer: 128 * 1024, env: { ...process.env, TMUX: '', LC_ALL: 'C.UTF-8' } });
       return stdout;
@@ -57,11 +61,103 @@ export class Sessions {
   }
   describe(row: TerminalRow) {
     const operation = this.busy.get(row.id), reason = row.stopped_reason;
-    const lifecycle = operation === 'stopping' ? 'stopping' : row.state === 'starting' ? 'starting'
+    const lifecycle = operation === 'restarting' ? 'starting' : operation === 'stopping' ? 'stopping' : row.state === 'starting' ? 'starting'
       : row.state === 'running' ? reason === 'spawn_uncertain' ? 'unknown' : 'running'
-      : reason === 'start_failed' || reason?.startsWith('job_exit_') || reason?.startsWith('job_signal_') ? 'error' : reason === 'job_exited' ? 'exited' : 'stopped';
+      : reason === 'start_failed' || reason === 'codex_restart_failed' || reason?.startsWith('job_exit_') || reason?.startsWith('job_signal_') ? 'error' : reason === 'job_exited' ? 'exited' : 'stopped';
     const native = lifecycle === 'running' && Date.now() - this.observedAt < 10000 ? this.activities.get(row.id) : undefined;
-    return { lifecycle, activity: native || 'unavailable', activitySource: native && native !== 'unavailable' ? 'codex_title' : 'unavailable', observedAt: this.observedAt };
+    return { lifecycle, activity: native || 'unavailable', activitySource: native && native !== 'unavailable' ? 'codex_title' : 'unavailable', observedAt: this.observedAt,
+      codexResumeAvailable: row.kind === 'codex' && !!this.resumeId(row.id) };
+  }
+  private resumeId(id: string) {
+    const record = this.store.db.prepare('SELECT value FROM metadata WHERE key=?').get('codex_resume:' + id) as { value: string } | undefined;
+    return record && CODEX_THREAD_ID.test(record.value) ? record.value : undefined;
+  }
+  private async onlyPane(row: TerminalRow) {
+    const lines = (await this.tmux(['list-panes', '-s', '-t', `=${row.tmux_name}`, '-F', '#{session_name}\t#{pane_id}\t#{pane_pid}\t#{pane_dead}'])).trim().split('\n');
+    assertValue(lines.length === 1, 409, 'codex_requires_single_pane');
+    const fields = lines[0]!.split('\t'), [name, pane, pid, dead] = fields;
+    assertValue(fields.length === 4 && name === row.tmux_name && /^%\d+$/.test(pane || '')
+      && /^[1-9]\d{0,9}$/.test(pid || '') && (dead === '0' || dead === '1'), 409, 'codex_target_changed');
+    return { pane: pane!, pid: Number(pid), dead: dead === '1' };
+  }
+  async restartCodex(id: string, expectedUpdatedAt: number, guard: () => void, detach: () => Promise<void>) {
+    assertValue(!this.stopped, 503, 'shutting_down');
+    const row = this.get(id);
+    assertValue(row.kind === 'codex', 409, 'codex_only');
+    assertValue(!this.busy.has(id) && !this.restarting, 409, 'codex_restart_busy');
+    assertValue(row.updated_at === expectedUpdatedAt, 409, 'session_changed_refresh');
+    assertValue(row.state === 'stopped' || (row.state === 'running' && !row.stopped_reason), 409, 'session_not_running_or_busy');
+    this.busy.set(id, 'restarting'); this.restarting = true; this.mutations++;
+    let reserved = false, spawnAttempted = false;
+    try {
+      // No side effects until the exact saved main conversation is known.
+      const cwd = await this.validateCwd(row.cwd);
+      const pane = row.state === 'running' || await this.exists(row.tmux_name) ? await this.onlyPane(row) : undefined;
+      assertValue(row.state === 'running' ? pane && !pane.dead : !pane || pane.dead, 409, 'codex_target_changed');
+      const identity = row.state === 'running' ? await this.codex.inspect(pane!.pid, cwd) : undefined;
+      const threadId = identity?.threadId || this.resumeId(id);
+      assertValue(threadId && CODEX_THREAD_ID.test(threadId), 409, 'codex_history_unavailable');
+      guard();
+      this.store.transaction(() => {
+        if (row.state === 'stopped') {
+          const n = Number(this.store.db.prepare("SELECT count(*) n FROM terminals WHERE state IN ('starting','running')").get()!.n);
+          assertValue(n < LIMITS.sessions, 409, 'session_limit');
+        }
+        // Existing schema-v1 metadata: one UUID, no transcript, credentials,
+        // serialized CLI config, or schema migration. Stale requests cannot
+        // restart the newly resumed process again after the first call finishes.
+        this.store.db.prepare('INSERT INTO metadata VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run('codex_resume:' + id, threadId);
+        this.store.db.prepare("UPDATE terminals SET state='starting',stopped_reason=NULL,updated_at=? WHERE id=?").run(Math.max(Date.now(), row.updated_at + 1), id);
+      });
+      reserved = true; this.activities.delete(id);
+      await detach(); guard();
+      if (identity) {
+        const current = await this.onlyPane(row);
+        assertValue(current.pane === pane!.pane && current.pid === pane!.pid && !current.dead, 409, 'codex_target_changed');
+        guard(); await this.codex.exit(identity, cwd, { socket: this.config.tmuxSocket, pane: pane!.pane, sessionName: row.tmux_name });
+        const deadline = Date.now() + 2000;
+        while (true) {
+          const current = await this.onlyPane(row);
+          assertValue(current.pane === pane!.pane && current.pid === pane!.pid, 409, 'codex_target_changed');
+          if (current.dead) break;
+          assertValue(Date.now() < deadline, 409, 'codex_exit_timeout');
+          await new Promise(resolve => setTimeout(resolve, 50));
+        }
+      }
+      guard(); assertValue(!this.stopped, 503, 'shutting_down');
+      // Explicit UUID only: --last could resume someone else's managed chat in
+      // the same directory. No prompt, auto-continue, shell string, or replay.
+      const program = ['codex', 'resume', threadId, ...(this.config.codexArgs ?? CODEX_ARGS), '--cd', cwd];
+      spawnAttempted = true;
+      if (pane) {
+        const current = await this.onlyPane(row);
+        assertValue(current.pane === pane.pane && current.pid === pane.pid && current.dead, 409, 'codex_target_changed');
+        guard();
+        // No -k: tmux itself refuses to replace a live/replaced pane.
+        await this.tmux(['respawn-pane', '-t', pane.pane, '-c', cwd, '--', ...program]);
+      } else {
+        await this.tmux(['new-session', '-d', '-s', row.tmux_name, '-c', cwd, '-x', '100', '-y', '30', '--', ...program]);
+        await this.tmux(['set-window-option', '-t', `=${row.tmux_name}:0`, 'window-size', 'manual']);
+      }
+      const next = await this.onlyPane(row);
+      await this.tmux(['set-option', '-p', '-t', next.pane, ACTIVITY_OPTION, ACTIVITY_VERSION]);
+      this.store.db.prepare("UPDATE terminals SET state='running',stopped_reason=NULL,updated_at=? WHERE id=?").run(Math.max(Date.now(), row.updated_at + 2), id);
+      return this.get(id);
+    } catch (error) {
+      if (reserved) {
+        // An uncertain command may already have started the new CLI. Retain its
+        // reservation and NEVER retry/kill it automatically. Saved UUID remains
+        // available for a deliberate Resume after a confirmed failure/exit.
+        let state = 'running', reason: string | null = 'spawn_uncertain';
+        try {
+          if (!await this.exists(row.tmux_name) || (await this.onlyPane(row)).dead) { state = 'stopped'; reason = 'codex_restart_failed'; }
+          else if (!spawnAttempted) reason = null;
+        } catch { /* fail closed while tmux state is uncertain */ }
+        this.store.db.prepare('UPDATE terminals SET state=?,stopped_reason=?,updated_at=? WHERE id=?').run(state, reason, Math.max(Date.now(), row.updated_at + 2), id);
+      }
+      if (error instanceof HttpError) throw error;
+      throw new HttpError(503, 'codex_restart_uncertain');
+    } finally { this.busy.delete(id); this.restarting = false; this.mutations++; }
   }
   async snapshot(id: string) {
     assertValue(!this.stopped, 503, 'shutting_down');
@@ -177,6 +273,7 @@ export class Sessions {
       // Metadata only: never signal tmux or touch the project/Codex history.
       const result = this.store.db.prepare("DELETE FROM terminals WHERE id=? AND state='stopped'").run(id);
       assertValue(result.changes === 1, 409, 'session_not_stopped');
+      this.store.db.prepare('DELETE FROM metadata WHERE key=?').run('codex_resume:' + id);
       this.activities.delete(id);
     } finally { this.busy.delete(id); this.mutations++; }
   }
@@ -240,11 +337,14 @@ export class Sessions {
     }
     this.prune();
   }
-  private prune() { this.store.db.exec("DELETE FROM terminals WHERE state='stopped' AND id IN (SELECT id FROM terminals ORDER BY created_at DESC,id LIMIT -1 OFFSET 180)"); }
+  private prune() {
+    this.store.db.exec("DELETE FROM terminals WHERE state='stopped' AND id IN (SELECT id FROM terminals ORDER BY created_at DESC,id LIMIT -1 OFFSET 180)");
+    this.store.db.exec("DELETE FROM metadata WHERE key GLOB 'codex_resume:*' AND substr(key,14) NOT IN (SELECT id FROM terminals)");
+  }
   async shutdown() {
     this.stopped = true;
     while (this.busy.size || this.snapshots) await new Promise(resolve => setTimeout(resolve, 20));
     if (this.reconciling) await this.reconciling;
   }
-  stats() { return { reservations: this.busy.size, snapshots: this.snapshots, activityRecords: this.activities.size, managedRunning: Number((this.store.db.prepare("SELECT count(*) n FROM terminals WHERE state IN ('starting','running')").get() as { n: number }).n) }; }
+  stats() { return { reservations: this.busy.size, codexRestarts: Number(this.restarting), snapshots: this.snapshots, activityRecords: this.activities.size, managedRunning: Number((this.store.db.prepare("SELECT count(*) n FROM terminals WHERE state IN ('starting','running')").get() as { n: number }).n) }; }
 }

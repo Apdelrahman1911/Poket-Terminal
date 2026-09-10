@@ -12,12 +12,13 @@ import { assertValue, HttpError } from './errors.js';
 import { TelegramBot } from './telegram-bot.js';
 import { Desktop } from './desktop.js';
 import type { NativeRunner } from './native-input.js';
+import type { CodexControl } from './codex-control.js';
 
-export async function createApp(config: Config, options: { tmux?: TmuxRunner; now?: () => number; telegram?: { endpoint: string; now?: () => number }; nativeRunner?: NativeRunner } = {}) {
+export async function createApp(config: Config, options: { tmux?: TmuxRunner; now?: () => number; telegram?: { endpoint: string; now?: () => number }; nativeRunner?: NativeRunner; codexControl?: CodexControl } = {}) {
   process.umask(0o077);
   const store = new Store(config.dataDir);
   const auth = new Auth(store, options.now);
-  const sessions = new Sessions(store, config, options.tmux);
+  const sessions = new Sessions(store, config, options.tmux, options.codexControl);
   try { await sessions.initialize(); } catch (e) { store.close(); throw e; }
   const bridges = new Bridges(auth, sessions, config, options.nativeRunner);
   const desktop = config.desktop ? new Desktop(auth, config) : undefined;
@@ -101,6 +102,15 @@ export async function createApp(config: Config, options: { tmux?: TmuxRunner; no
   app.post<{ Params: { id: string }; Body: { confirm: string } }>('/api/sessions/:id/stop', { schema: { ...objectBody({ confirm: { type: 'string', pattern: '^[a-f0-9]{32}$' } }, ['confirm']), params: idParams } }, async req => {
     assertValue(req.body.confirm === req.params.id, 400, 'confirmation_required');
     const session = await sessions.stop(req.params.id); bridges.stopSession(req.params.id); return { session: present(session) };
+  });
+  app.post<{ Params: { id: string }; Body: { confirm: string; expectedUpdatedAt: number } }>('/api/sessions/:id/restart-codex', {
+    schema: { ...objectBody({ confirm: { type: 'string', pattern: '^[a-f0-9]{32}$' }, expectedUpdatedAt: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER } }, ['confirm', 'expectedUpdatedAt']), params: idParams },
+  }, async req => {
+    assertValue(req.body.confirm === req.params.id, 400, 'confirmation_required');
+    const raw = cookieToken(req.headers.cookie);
+    const guard = () => { assertValue(auth.authenticate(raw), 401, 'authentication_required'); };
+    const session = await sessions.restartCodex(req.params.id, req.body.expectedUpdatedAt, guard, () => bridges.prepareCodexRestart(req.params.id));
+    return { session: present(session) };
   });
   app.delete<{ Params: { id: string }; Body: { confirm: string } }>('/api/sessions/:id', { schema: { ...objectBody({ confirm: { type: 'string', pattern: '^[a-f0-9]{32}$' } }, ['confirm']), params: idParams } }, async req => {
     assertValue(req.body.confirm === req.params.id, 400, 'confirmation_required');

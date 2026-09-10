@@ -205,6 +205,33 @@ login UI; this is only defense in depth (HTTP JavaScript can be tampered with).
 
 ## Daily browser and phone use
 
+### Reload Codex configuration without losing the conversation
+
+After editing your private `~/.codex/config.toml`, select the running **Codex**
+session and click **Restart & resume**. Confirm only when you are ready to
+interrupt its current task/sub-agents and discard any unsent draft. Waiting until
+Codex is idle is recommended. The app uses Codex's own exit shortcut, waits for
+that process to end, and launches `codex resume <exact-conversation-UUID>` in the
+same managed terminal and working directory. It never uses `--last`, submits a
+prompt, forces replacement of a live pane, or automatically replays work.
+
+The new CLI reads the current configuration; explicit PocketTerminal launch
+overrides (full access, approval policy, activity title and any configured
+`PT_CODEX_*` overrides) still take precedence. This does **not** reload the web
+supervisor's environment. Once linked by this action, a stopped entry also has
+**Resume Codex**, including after a restart/configuration failure. An unlinked
+older stopped chat must still be selected manually with `codex resume` in a Shell.
+
+Requires Linux/Python 3 with pidfd support, a directly managed Codex TUI, one
+pane in the managed session, and identifiable saved main-chat metadata. Tested
+against CLI **0.153.4**. Unknown/ambiguous identities fail closed without guessing
+history or sending exit keys. Shells, nested/manually replaced programs, empty
+unsaved chats and unsupported CLI layouts use the manual workflow. Ordinary
+**Disconnect** continues to leave Codex running. No CLI is restarted just because
+the website/backend is updated. See [restart behavior and bounds](docs/codex-restart.md).
+
+### Terminal controls
+
 Create a **Shell** first to check project selection. Create **Codex** after the
 optional CLI setup below. Only the selected visible terminal renders; other jobs
 continue without a viewer. Tap **Take control** when view-only; browsers and

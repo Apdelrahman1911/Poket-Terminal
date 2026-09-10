@@ -7,7 +7,7 @@ import { WebSocket, WebSocketServer } from 'ws';
 import { Auth, cookieToken, csrfFor, equal } from './auth.js';
 import { Config, LIMITS } from './config.js';
 import { Sessions, TerminalRow } from './sessions.js';
-import { assertValue } from './errors.js';
+import { assertValue, HttpError } from './errors.js';
 import { InputTarget, NativeAction, NativeInput, NativeRunner } from './native-input.js';
 
 interface Connection {
@@ -65,7 +65,7 @@ export class Bridges {
     if (protocols.length !== 2 || protocols[0] !== 'pocketterminal.v1' || !equal(protocols[1] || '', `csrf.${csrfFor(raw)}`)) return deny(403);
     if (this.connections.size >= LIMITS.attachments || this.nativePtys.size >= LIMITS.attachments) return deny(429);
     let session: TerminalRow;
-    try { session = this.sessions.get(match[1]!); } catch { return deny(404); }
+    try { session = this.sessions.inputReady(match[1]!); } catch (error) { return deny(error instanceof HttpError && error.status === 404 ? 404 : 409); }
     if (session.state !== 'running') return deny(409);
     // No async gap between cap check, authorization and allocation.
     this.wss.handleUpgrade(req, socket, head, ws => {
@@ -322,10 +322,24 @@ export class Bridges {
     else if (c.ws.readyState !== WebSocket.CLOSED) c.ws.terminate();
   }
   revokeInvalid() { for (const c of this.connections.values()) if (!c.done && !this.auth.authenticate(c.raw)) this.detach(c, 'auth_revoked', 4001); }
-  stopSession(id: string) {
+  stopSession(id: string, reason: 'session_stopped' | 'codex_restarting' = 'session_stopped') {
     if (this.telegramJob?.id === id) this.telegramJob.abort.abort();
-    for (const c of this.connections.values()) if (c.session.id === id) this.detach(c, 'session_stopped');
+    for (const c of this.connections.values()) if (c.session.id === id) this.detach(c, reason);
     this.controllers.delete(id); this.controlRevisions.delete(id);
+  }
+  async prepareCodexRestart(id: string) {
+    const input = this.telegramJob?.id === id ? this.telegramJob.done : undefined;
+    this.stopSession(id, 'codex_restarting');
+    // Wait only for this entry's cancelled input. Do not clear the global
+    // transient buffer while a different session's Telegram input is using it.
+    if (input) { try { await input; } catch { /* cancelled input is never replayed */ } }
+    await this.resizeJobs.get(id)?.done;
+    await this.historyJobs.get(id);
+    const deadline = Date.now() + 2500;
+    while ([...this.nativePtys.values()].some(c => c.session.id === id)) {
+      assertValue(Date.now() < deadline, 503, 'codex_detach_timeout');
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
   }
   private sweep() {
     const now = Date.now(); this.ticks++;

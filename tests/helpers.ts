@@ -7,6 +7,7 @@ import { WebSocket } from 'ws';
 import { createApp } from '../src/server/app.js';
 import type { TmuxRunner } from '../src/server/sessions.js';
 import type { NativeRunner } from '../src/server/native-input.js';
+import type { CodexControl } from '../src/server/codex-control.js';
 import { configFromEnv, ROOT, Config } from '../src/server/config.js';
 import { BOT_USERNAME, BOT_ID } from './identities.js';
 // Test tmux filesystem sockets stay inside this disposable checkout.
@@ -47,9 +48,9 @@ export function cleanupTmux(config: Config) {
   if (!config.tmuxSocket.startsWith('pt-test-')) throw new Error('Refuse to clean non-test socket');
   try { execFileSync('tmux', ['-L', config.tmuxSocket, 'kill-server'], { stdio: 'ignore' }); } catch { /* no test server */ }
 }
-export async function harness(name: string, options: { initialize?: boolean; now?: () => number; tmux?: TmuxRunner; telegram?: { endpoint: string; now?: () => number }; nativeRunner?: NativeRunner } = {}) {
+export async function harness(name: string, options: { initialize?: boolean; now?: () => number; tmux?: TmuxRunner; telegram?: { endpoint: string; now?: () => number }; nativeRunner?: NativeRunner; codexControl?: CodexControl } = {}) {
   const config = await testConfig(name);
-  const service = await createApp(config, { now: options.now, tmux: options.tmux, telegram: options.telegram, nativeRunner: options.nativeRunner });
+  const service = await createApp(config, { now: options.now, tmux: options.tmux, telegram: options.telegram, nativeRunner: options.nativeRunner, codexControl: options.codexControl });
   if (options.initialize !== false) await service.auth.setPassword(TEST_PASSWORD, 'init');
   await service.app.listen({ host: config.host, port: config.port });
   const headers = { host: new URL(config.origin).host, origin: config.origin };

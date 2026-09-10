@@ -90,6 +90,7 @@ export class ActiveTerminal {
       if (event.code === 4001) { this.dispose(); this.expired(); return; }
       const reason = event.reason.includes('slow') || event.reason.includes('limit')
         ? 'Rendering fell behind; attachment released to protect memory. Reconnect for a fresh tmux redraw.'
+        : event.reason === 'codex_restarting' ? 'Codex is restarting. Reconnect when it is running; no keystrokes will be replayed.'
         : event.reason === 'session_stopped' ? 'This session was stopped.' : 'Detached. Reconnect to the running job; no keystrokes will be replayed.';
       this.fail(reason);
     };

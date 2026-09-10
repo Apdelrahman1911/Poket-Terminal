@@ -7,16 +7,19 @@ import { useViewportLayout } from './viewport';
 import { request } from './api';
 import { CopyOutput } from './copy';
 import { sessionCard } from './session-card';
+import { codexRestartError } from './codex-restart';
 
 interface AuthState { authenticated: boolean; csrf?: string; expiresAt?: number; setupRequired?: boolean; defaultCwd?: string; desktop?: boolean }
-interface Session { id: string; label: string; kind: 'codex' | 'shell'; cwd: string; state: 'starting' | 'running' | 'stopped'; ssh: string; stopped_reason: string | null; lifecycle?: 'starting' | 'running' | 'stopping' | 'stopped' | 'exited' | 'error' | 'unknown'; activity?: 'working' | 'awaiting_input' | 'ready' | 'unknown' | 'unavailable'; activitySource?: string; observedAt?: number }
+interface Session { id: string; label: string; kind: 'codex' | 'shell'; cwd: string; state: 'starting' | 'running' | 'stopped'; ssh: string; stopped_reason: string | null; updated_at: number; codexResumeAvailable?: boolean; lifecycle?: 'starting' | 'running' | 'stopping' | 'stopped' | 'exited' | 'error' | 'unknown'; activity?: 'working' | 'awaiting_input' | 'ready' | 'unknown' | 'unavailable'; activitySource?: string; observedAt?: number }
 interface Project { name: string; path: string }
 // Clipboard permission/read promises cannot be cancelled. Permit one globally, never queue more.
 let clipboardReadPending = false;
 function useVisible() {
-  const [visible, setVisible] = useState(document.visibilityState === 'visible');
+  const [state, setState] = useState({ visible: document.visibilityState === 'visible', activation: 0 });
   useEffect(() => {
     let frozen = false;
+    const setVisible = (visible: boolean) => setState(previous => previous.visible === visible ? previous
+      : { visible, activation: previous.activation + Number(visible) });
     const change = () => setVisible(!frozen && document.visibilityState === 'visible');
     const hide = () => { frozen = true; setVisible(false); };
     const show = () => { frozen = false; change(); };
@@ -24,7 +27,7 @@ function useVisible() {
     window.addEventListener('pagehide', hide); window.addEventListener('pageshow', show);
     return () => { document.removeEventListener('visibilitychange', change); document.removeEventListener('freeze', hide); document.removeEventListener('resume', show); window.removeEventListener('pagehide', hide); window.removeEventListener('pageshow', show); };
   }, []);
-  return visible;
+  return state;
 }
 function TerminalPane({ session, csrf, expired, attachment }: { session: Session; csrf: string; expired: () => void; attachment: (id: string, state: TerminalState) => void }) {
   const host = useRef<HTMLDivElement>(null), active = useRef<ActiveTerminal | null>(null);
@@ -75,7 +78,7 @@ function TerminalPane({ session, csrf, expired, attachment }: { session: Session
 }
 function App() {
   useViewportLayout();
-  const visible = useVisible();
+  const { visible, activation } = useVisible();
   const authGeneration = useRef(0), catalogGeneration = useRef(0);
   const [auth, setAuth] = useState<AuthState | null>(null), [password, setPassword] = useState(''), [error, setError] = useState(''), [busy, setBusy] = useState(false);
   const [sessions, setSessions] = useState<Session[]>([]), [projects, setProjects] = useState<Project[]>([]);
@@ -88,6 +91,7 @@ function App() {
   const attachment = useCallback((id: string, state: TerminalState) => setAttached({ id, state }), []);
   const [label, setLabel] = useState(''), [kind, setKind] = useState<'codex' | 'shell'>('codex'), [cwd, setCwd] = useState('');
   const [rename, setRename] = useState(false), [renameText, setRenameText] = useState('');
+  const [restartingId, setRestartingId] = useState(''), restartPending = useRef(false);
   const expired = useCallback(() => { authGeneration.current++; setAuth({ authenticated: false }); setSessions([]); setSelectedMetadata(null); setCatalogFresh(false); setProjects([]); setError('Login expired or revoked. Your jobs have not been stopped.'); }, []);
   const choose = (id: string) => { if (selectedRef.current !== id) catalogGeneration.current++; selectedRef.current = id; setSelected(id); if (id) sessionStorage.setItem('pt-selected', id); else sessionStorage.removeItem('pt-selected'); setRename(false); };
   useEffect(() => {
@@ -159,6 +163,31 @@ function App() {
       if (selectedRef.current === session.id) choose(''); // Never detach a different selected job.
     });
   }
+  function restartCodex(session: Session) {
+    if (restartPending.current || busy) return;
+    const message = session.state === 'running'
+      ? `Restart & resume “${session.label}”? This interrupts its current task/sub-agents and discards unsent input. Codex exits, then resumes the SAME saved conversation with its current config. Unfinished work is not automatically replayed. Wait until it is idle when possible.`
+      : `Resume “${session.label}”? Start Codex with its current config and this entry's saved conversation. No prompt or unfinished work will be replayed.`;
+    if (!confirm(message)) return;
+    restartPending.current = true; setRestartingId(session.id);
+    const generation = authGeneration.current, controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 20000);
+    void action(async () => {
+      let result: { session: Session };
+      try {
+        result = await request(`/api/sessions/${session.id}/restart-codex`, 'POST', { confirm: session.id, expectedUpdatedAt: session.updated_at }, auth?.csrf, controller.signal);
+      } catch (error) { throw new Error(codexRestartError((error as Error).name === 'AbortError' ? 'restart_request_timeout' : (error as Error).message)); }
+      if (generation !== authGeneration.current) return;
+      catalogGeneration.current++;
+      setSessions(current => current.map(row => row.id === session.id ? result.session : row));
+      setSelectedMetadata(current => current?.id === session.id ? result.session : current);
+      // Do not switch selection or recreate another session's renderer if the
+      // owner selected a different terminal while the request was in flight.
+    }).finally(() => {
+      clearTimeout(timer); restartPending.current = false; setRestartingId('');
+      if (generation === authGeneration.current) void refresh();
+    });
+  }
   if (!auth?.authenticated) return <main className="login-shell"><div className="brand-mark">›_</div><h1>PocketTerminal</h1><p className="muted">Your VPS. Your sessions. Securely in your pocket.</p>
     <form onSubmit={event => void login(event)} className="login-card"><h2>Owner access</h2><p>This terminal runs as <strong>root</strong>. Keep your password private.</p>
       {auth?.setupRequired ? <p className="notice">Secure setup is pending. Initialize the owner password through private SSH; there is no default password.</p> : <><label htmlFor="password">Password</label><input id="password" type="password" autoComplete="current-password" maxLength={256} required value={password} onChange={e => setPassword(e.target.value)} /><button className="primary" disabled={busy || !auth}>{busy ? 'Signing in…' : 'Sign in'}</button></>}
@@ -187,9 +216,11 @@ function App() {
       <small className="catalog-state" role="status">{!visible ? 'Status paused' : catalogFresh ? 'Live metadata · updates every3s · 20 cards/page' : 'Status unknown · reconnecting…'}</small>
       <details className="activity-help"><summary>Activity meaning</summary><p>Lifecycle is process state; CLI activity is the native title of the active pane/window of new Codex sessions, not output guessing. Ready means ready for input, not that the last task succeeded. Nonfatal CLI/API errors are not detected; Error means a verified start/exit failure. Existing/older Codex sessions lack activity reporting and keep running normally; new Codex sessions support it. Shells and inactive/replaced programs may not report activity either. Activity not reported is not a failure. Browser attachment is separate.</p><p>Colors: blue working; amber input; green ready; violet starting; orange stopping; grey stopped/exited; red error. Dashed teal: activity not reported. Dotted: stale/unconfirmed. A light border marks selection; an outer outline marks keyboard focus.</p></details>
       <p className="sidebar-note">500-line browser scrollback · 2,000-line tmux history.<br />Inactive sessions use no browser terminals.</p>
-    </aside><div className="terminal-area">{selectedSession ? <><div className="session-header"><div><h1>{selectedSession.label}</h1><small>{selectedSession.cwd}</small></div><div className="session-actions"><button onClick={() => { setRenameText(selectedSession.label); setRename(!rename); }}>Rename</button>{selectedSession.state === 'stopped' ? <button className="danger" disabled={busy} onClick={() => deleteEntry(selectedSession)}>Delete</button> : <button className="danger" disabled={busy} onClick={() => { if (confirm(`Stop “${selectedSession.label}”? This terminates only this job and cannot be undone.`)) void action(async () => { await request(`/api/sessions/${selectedSession.id}/stop`, 'POST', { confirm: selectedSession.id }, auth.csrf); await refresh(); }); }}>Stop</button>}</div></div>
+    </aside><div className="terminal-area">{selectedSession ? <><div className="session-header"><div><h1>{selectedSession.label}</h1><small>{selectedSession.cwd}</small></div><div className="session-actions"><button onClick={() => { setRenameText(selectedSession.label); setRename(!rename); }}>Rename</button>
+      {selectedSession.kind === 'codex' && (selectedSession.state === 'running' || selectedSession.codexResumeAvailable) && <button disabled={busy || !catalogFresh || selectedSession.state === 'starting'} title="Reload Codex configuration by exiting and resuming the exact saved conversation. Existing launch overrides still take precedence." onClick={() => restartCodex(selectedSession)}>{restartingId === selectedSession.id ? 'Restarting…' : selectedSession.state === 'stopped' ? 'Resume Codex' : 'Restart & resume'}</button>}
+      {selectedSession.state === 'stopped' ? <button className="danger" disabled={busy} onClick={() => deleteEntry(selectedSession)}>Delete</button> : <button className="danger" disabled={busy} onClick={() => { if (confirm(`Stop “${selectedSession.label}”? This terminates only this job and cannot be undone.`)) void action(async () => { await request(`/api/sessions/${selectedSession.id}/stop`, 'POST', { confirm: selectedSession.id }, auth.csrf); await refresh(); }); }}>Stop</button>}</div></div>
       {rename && <form className="rename-form" onSubmit={e => { e.preventDefault(); void action(async () => { await request(`/api/sessions/${selectedSession.id}`, 'PATCH', { label: renameText }, auth.csrf); setRename(false); await refresh(); }); }}><input aria-label="New session label" maxLength={80} value={renameText} onChange={e => setRenameText(e.target.value)} /><button disabled={busy}>Save name</button></form>}
-      {visible && selectedSession.state === 'running' ? <TerminalPane key={selectedSession.id} session={selectedSession} csrf={auth.csrf!} expired={expired} attachment={attachment} /> : <div className="empty-terminal"><h2>{!visible ? 'Terminal suspended' : selectedSession.state === 'starting' ? 'Starting · not started yet' : selectedSession.lifecycle === 'error' ? 'Job exited with error' : selectedSession.lifecycle === 'exited' ? 'Job exited' : 'Session stopped'}</h2>{visible && selectedSession.stopped_reason && <small>{selectedSession.stopped_reason.replaceAll('_', ' ')}</small>}<p>{visible ? 'Jobs are never restarted automatically after exit or a VPS reboot. Create a new terminal and intentionally resume any Codex history with the CLI.' : 'Browser resources released. Your job is still running.'}</p></div>}
+      {visible && selectedSession.state === 'running' && restartingId !== selectedSession.id ? <TerminalPane key={`${selectedSession.id}:${activation}`} session={selectedSession} csrf={auth.csrf!} expired={expired} attachment={attachment} /> : <div className="empty-terminal"><h2>{!visible ? 'Terminal suspended' : restartingId === selectedSession.id ? 'Restarting Codex…' : selectedSession.state === 'starting' ? 'Starting · not started yet' : selectedSession.lifecycle === 'error' ? 'Job exited with error' : selectedSession.lifecycle === 'exited' ? 'Job exited' : 'Session stopped'}</h2>{visible && selectedSession.stopped_reason && <small>{selectedSession.stopped_reason.replaceAll('_', ' ')}</small>}<p>{!visible ? 'Browser resources released. Your job is still running.' : restartingId === selectedSession.id ? 'Exiting Codex and resuming the same saved conversation. No input is replayed.' : selectedSession.codexResumeAvailable ? 'Use Resume Codex to intentionally resume this saved conversation. Jobs are never restarted automatically.' : 'Jobs are never restarted automatically after exit or a VPS reboot. Create a new terminal and intentionally resume any Codex history with the CLI.'}</p></div>}
       <details className="ssh-help"><summary>Connect from SSH</summary><code>{selectedSession.ssh}</code><button onClick={() => void navigator.clipboard.writeText(selectedSession.ssh).catch(() => setError('Select and copy the SSH command manually.'))}>Copy SSH command</button><small>Detach with Ctrl+B, then D (also works in the browser). Browsers and the paired Telegram bot share input control. SSH attaches directly and is outside that controller rule.</small></details>
     </> : <div className="empty-terminal"><div className="brand-mark">›_</div><h1>A small window into your VPS</h1><p>Select a session or create one. Closing this page detaches the viewer, not the job.</p><small>Running tmux jobs survive browser/backend disconnects, not a VPS reboot.</small></div>}</div></div></main>;
 }

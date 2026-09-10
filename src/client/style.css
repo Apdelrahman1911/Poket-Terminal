@@ -26,3 +26,5 @@
 .session-item[data-state][aria-current=true]{background:var(--session-bg);border-top-color:#dce8f8;border-right-color:#dce8f8;border-bottom-color:#dce8f8;box-shadow:inset 0 0 0 1px #dce8f8}
 .session-item[data-state]:focus-visible{outline:2px solid #fff;outline-offset:2px}
 @media(forced-colors:active){.session-item[data-state][aria-current=true]{border-top-color:Highlight;border-right-color:Highlight;border-bottom-color:Highlight}.session-item[data-state]:focus-visible{outline-color:Highlight}}
+.session-actions{flex-wrap:wrap;justify-content:flex-end;flex-shrink:0}
+@media(max-width:520px){.session-header{flex-wrap:wrap;gap:6px}.session-header>div:first-child{flex:1 1 100%}.session-actions{width:100%;justify-content:flex-start}.session-actions button{min-height:38px}}
