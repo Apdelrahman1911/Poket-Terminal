@@ -13,6 +13,7 @@ import { FleetLinkState, validateFleetLink } from '../src/server/telegram-fleet-
 import { testConfig, until, delay, cleanupTmux, freePort } from './helpers.js';
 import { fakeTelegram, dummyState, message, OWNER, BOT_ID } from './telegram-fake.js';
 import { TelegramState } from '../src/server/telegram-state.js';
+import { notifyLocal } from '../src/server/agent-notify-client.js';
 process.umask(0o077);
 
 test('private fleet configuration refuses public/wildcard addresses and unsafe TLS files', async () => {
@@ -274,6 +275,20 @@ test('five VPSs share ONE bot: all-server alerts, exact-target replies/buttons, 
     await click(stopped, 'Confirm stop'); assert.equal(services[2]!.sessions.get(rows[2]!.id).state, 'running');
     rows[1] = await services[1]!.sessions.create({ kind: 'shell', label: 'Synthetic replacement VPS 2' });
 
+    // Explicit agent updates also arrive from every VPS while selection stays
+    // on VPS 3. The root-local ingress cannot create another upstream client.
+    await until(() => services.every(s => s.telegram.stats().status === 'polling'), 12000);
+    const beforeAgents = last();
+    const agentReceipts = await Promise.all(services.map((s, i) => notifyLocal(s.agentNotify!.path, { kind: 'progress', text: 'Synthetic agent milestone', session: rows[i]!.id })));
+    assert(agentReceipts.every(r => r.status === 'sent'));
+    const agentWave = fake.sent.filter(m => m.message_id > beforeAgents && m.text.includes('Synthetic agent milestone'));
+    assert.equal(agentWave.length, 5);
+    for (let i = 0; i < 5; i++) {
+      const sent = agentWave.find(m => m.text.startsWith(`[VPS ${i + 1}]`)); assert(sent); assert(sent.text.includes(rows[i]!.id));
+      assert.match(sent.reply_markup.inline_keyboard[0][0].callback_data, new RegExp('n:select:' + rows[i]!.id + '$'));
+    }
+    assert(services.every(s => s.telegram.stats().agentUpdates.textBytes === 0));
+
     // Simulated native activity transitions, no Codex/model request. Selection
     // remains VPS 3 for the entire wave. All five independent observers notify.
     let activity = 'working';
@@ -325,7 +340,7 @@ test('five VPSs share ONE bot: all-server alerts, exact-target replies/buttons, 
     await removeFleetWorker(config, grants[3].node.id);
     await until(() => !hub.fleet!.stats().nodes.some(n => n.id === grants[3].node.id), 5000);
     assert.equal(services[4]!.sessions.get(rows[4]!.id).state, 'running');
-    const report = { synthetic: true, realTelegram: false, vpsCount: 5, notificationSourcesWithoutSwitching: wave, maxConcurrentUpstreamRequests: fake.maxActive, maxPolls: fake.maxPolls, maxOutgoing: fake.maxOutgoing,
+    const report = { synthetic: true, realTelegram: false, vpsCount: 5, notificationSourcesWithoutSwitching: wave, agentNotificationSourcesWithoutSwitching: agentWave.map(m => m.text.slice(0, 7)), maxConcurrentUpstreamRequests: fake.maxActive, maxPolls: fake.maxPolls, maxOutgoing: fake.maxOutgoing,
       reconnectCycles: 6, controllerRestarts: 1, heapSamples, beforeDisconnect: process.memoryUsage(), fleet: hub.fleet!.stats(), nativeAttachmentsCreated: states.reduce((n, s) => n + s.bridge.created, 0), privateInputReplayed: false };
     for (const service of services.slice(1)) await service.close();
     await delay(100); (globalThis as { gc?: () => void }).gc?.();

@@ -134,9 +134,9 @@ export class Sessions {
         assertValue(current.pane === pane.pane && current.pid === pane.pid && current.dead, 409, 'codex_target_changed');
         guard();
         // No -k: tmux itself refuses to replace a live/replaced pane.
-        await this.tmux(['respawn-pane', '-t', pane.pane, '-c', cwd, '--', ...program]);
+        await this.tmux(['respawn-pane', '-t', pane.pane, '-c', cwd, '-e', 'PT_SESSION_ID=' + id, '--', ...program]);
       } else {
-        await this.tmux(['new-session', '-d', '-s', row.tmux_name, '-c', cwd, '-x', '100', '-y', '30', '--', ...program]);
+        await this.tmux(['new-session', '-d', '-s', row.tmux_name, '-c', cwd, '-x', '100', '-y', '30', '-e', 'PT_SESSION_ID=' + id, '--', ...program]);
         await this.tmux(['set-window-option', '-t', `=${row.tmux_name}:0`, 'window-size', 'manual']);
       }
       const next = await this.onlyPane(row);
@@ -212,7 +212,7 @@ export class Sessions {
     this.busy.set(id, 'starting'); this.mutations++;
     try {
       const program = kind === 'codex' ? ['codex', ...(this.config.codexArgs ?? CODEX_ARGS)] : [this.config.shell, '--noprofile', '--norc', '-i'];
-      await this.tmux(['new-session', '-d', '-s', name, '-c', cwd, '-x', '100', '-y', '30', '--', ...program]);
+      await this.tmux(['new-session', '-d', '-s', name, '-c', cwd, '-x', '100', '-y', '30', '-e', 'PT_SESSION_ID=' + id, '--', ...program]);
       // tmux 3.4 crashes creating its first window with a global manual default. Set it on the existing window only.
       await this.tmux(['set-window-option', '-t', `=${name}:0`, 'window-size', 'manual']);
       if (kind === 'codex') await this.tmux(['set-option', '-p', '-t', `=${name}:0.0`, ACTIVITY_OPTION, ACTIVITY_VERSION]);

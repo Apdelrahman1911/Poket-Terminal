@@ -10,6 +10,7 @@ import { Sessions, TerminalRow, TmuxRunner } from './sessions.js';
 import { Bridges, requestOriginAllowed } from './bridge.js';
 import { assertValue, HttpError } from './errors.js';
 import { TelegramBot } from './telegram-bot.js';
+import { AgentNotifyServer } from './agent-notify-server.js';
 import { TelegramApiError } from './telegram-api.js';
 import { TelegramState } from './telegram-state.js';
 import { TelegramFleetHub } from './telegram-fleet-hub.js';
@@ -43,6 +44,7 @@ export async function createApp(config: Config, options: { tmux?: TmuxRunner; no
     state: new FleetLocalState(config), factory: () => fleet.localTransport(), lockName: 'fleet-local', enabled: () => fleet.isReady(),
   } : fleetConfig?.role === 'worker' ? { factory: () => new FleetRemoteTransport(fleetConfig, config), enabled: workerEnabled,
     runtimeValid: api => api instanceof FleetRemoteTransport && api.healthy } : undefined);
+  const agentNotify = config.telegramBot ? new AgentNotifyServer(config, telegram) : undefined;
   const serverOptions = { ajv: { customOptions: { removeAdditional: false, coerceTypes: false } }, logger: false as const, trustProxy: false as const, bodyLimit: 2048, requestTimeout: 10000, connectionTimeout: 15000, keepAliveTimeout: 5000,
     maxRequestsPerSocket: 1000, onProtoPoisoning: 'error' as const, onConstructorPoisoning: 'error' as const };
   const app = Fastify({ ...serverOptions, ...(config.tls ? { serverFactory: (handler: import('node:http').RequestListener) => https.createServer({ key: fs.readFileSync(config.tls!.key), cert: fs.readFileSync(config.tls!.cert) }, handler) } : {}) });
@@ -50,6 +52,7 @@ export async function createApp(config: Config, options: { tmux?: TmuxRunner; no
   app.server.maxHeadersCount = 64;
   const privateFleet = link?.role === 'controller' ? new FleetPrivateListener(link, linkMaterial!, (req, res) => { app.server.emit('request', req, res); }) : undefined;
   if (privateFleet) app.addHook('onReady', async () => { await privateFleet.start(); });
+  if (agentNotify) app.addHook('onReady', async () => { await agentNotify.start(); });
   // One exact upgrade dispatcher. No second listener can reject/consume an
   // already upgraded socket; unknown/query-string routes never allocate natives.
   const upgrade = (req: import('node:http').IncomingMessage, socket: import('node:stream').Duplex, head: Buffer) => {
@@ -198,9 +201,9 @@ export async function createApp(config: Config, options: { tmux?: TmuxRunner; no
   app.addHook('onClose', async () => {
     if (closed) return; closed = true;
     clearInterval(reconcileTimer); app.server.off('upgrade', upgrade);
-    await privateFleet?.close(); await fleet?.close(); await telegram.close(); await bridges.close(); await desktop?.close(); await sessions.shutdown(); store.close();
+    await agentNotify?.close(); await privateFleet?.close(); await fleet?.close(); await telegram.close(); await bridges.close(); await desktop?.close(); await sessions.shutdown(); store.close();
   });
-  return { app, store, auth, sessions, bridges, telegram, fleet, desktop,
-    stats: () => ({ pid: process.pid, uptime: process.uptime(), memory: process.memoryUsage(), bridges: bridges.stats(), sessions: sessions.stats(), auth: auth.stats(), telegram: telegram.stats(), fleet: fleet?.stats(), desktop: desktop?.stats() }),
-    close: async () => { await privateFleet?.close(); await fleet?.close(); await telegram.close(); await bridges.close(); await desktop?.close(); await app.close(); } };
+  return { app, store, auth, sessions, bridges, telegram, fleet, desktop, agentNotify,
+    stats: () => ({ pid: process.pid, uptime: process.uptime(), memory: process.memoryUsage(), bridges: bridges.stats(), sessions: sessions.stats(), auth: auth.stats(), telegram: telegram.stats(), agentNotify: agentNotify?.stats(), fleet: fleet?.stats(), desktop: desktop?.stats() }),
+    close: async () => { await agentNotify?.close(); await privateFleet?.close(); await fleet?.close(); await telegram.close(); await bridges.close(); await desktop?.close(); await app.close(); } };
 }

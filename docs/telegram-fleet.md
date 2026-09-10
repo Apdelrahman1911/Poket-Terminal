@@ -34,6 +34,10 @@ does not block worker replies or callback acknowledgements. The outgoing queue
 and shared send-rate limit still apply; a private link cannot remove Telegram's
 own network delay or make a busy CLI finish faster.
 
+Agents can also explicitly send important progress, blockers or questions using
+[`pocketterminal-notify`](agent-notifications.md). These use the same authenticated
+VPS prefix and reach the owner from every node without switching servers.
+
 ## Configure the first/controller VPS
 
 First deploy this version and complete ordinary private Telegram pairing on

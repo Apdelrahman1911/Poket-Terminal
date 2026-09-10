@@ -366,6 +366,11 @@ Slow provider/public hops can use an [optional encrypted private-network route](
 without another daemon or exposing a new public port. Polling never holds up the
 bounded outgoing reply lane.
 
+For important messages **while agents work**, install the lightweight
+[`pocketterminal-notify` helper](docs/agent-notifications.md) on each VPS and add
+the documented Codex/Claude guidance. Milestones, blockers and questions use the
+same bot, with VPS/session labels, bounded memory and no additional public port.
+
 ## Optional private desktop
 
 Desktop is **off/unprovisioned by default**, with no additional public port.

@@ -8,6 +8,7 @@ import { TelegramControl, TelegramLock, TelegramState } from './telegram-state.j
 import { discardBacklog, TG_LIMITS, TelegramApi, TelegramApiError, TelegramTransport, updateId, updates, verifyBot } from './telegram-api.js';
 import { callback, fresh, Message, privateMessage, userMessage } from './telegram-update.js';
 import { BOT_COMMANDS, navigationData, parseNavigation, SESSION_COMMANDS, SessionCommand, sessionCommand } from './telegram-ui.js';
+import { AgentNotices, agentRequest, rejected, type AgentMessage } from './agent-notices.js';
 
 type Action = 'sessions' | 'select' | 'kinds' | 'projects' | 'create' | 'rename' | 'text' | 'prompt' | 'key' | 'output' | 'stop' | 'delete' | 'take' | 'release' | 'exit_history' | 'notifications' | 'help' | 'cancel' | 'picker' | 'choose';
 interface Bound {
@@ -73,9 +74,12 @@ export class TelegramBot {
   private rejected = 0;
   private now: () => number;
   private supported: boolean;
+  private agentNotices: AgentNotices;
+  private agentResolving = false;
   constructor(private sessions: Sessions, private bridges: Bridges, private config: Config, private test?: { endpoint: string; now?: () => number }, private driver?: TelegramDriver) {
     if (test && !config.testMode) throw new Error('Telegram fake transport requires isolated test mode');
     this.now = test?.now || Date.now;
+    this.agentNotices = new AgentNotices(this.now);
     this.supported = !config.testMode || !!test;
     this.state = driver?.state || new TelegramState(config);
   }
@@ -131,6 +135,7 @@ export class TelegramBot {
       }).finally(async () => {
         runtime.abort.abort(); runtime.api.close();
         this.actions.clear(); this.replies.clear(); this.baseline.clear(); this.pending.clear(); this.baselineReady = false;
+        this.agentNotices.clear('unavailable');
         await this.bridges.releaseTelegram(); await lock.close();
         if (this.runtime === runtime) this.runtime = undefined;
       });
@@ -182,10 +187,14 @@ export class TelegramBot {
           this.state.claim(r.control.epoch, id + 1); r.cursor = id + 1;
           this.guard(r); await this.handle(update, r);
         }
+        // Local agents enqueue only. All actual sends remain inside this actor,
+        // AFTER owner controls, using its one transport and existing send pace.
+        await this.sendAgentNotice(r); this.guard(r);
         this.status = 'polling'; backoff = TG_LIMITS.intervalMs;
       } catch (error) {
         if (!this.enabled(r)) break;
         this.pending.clear(); // no offline alert/outbox growth or delivery retry
+        this.agentNotices.clear('unavailable');
         this.status = 'offline_or_action_failed';
         backoff = Math.min(TG_LIMITS.maxBackoffMs, Math.max(1000, backoff * 2, error instanceof TelegramApiError ? error.retryMs : 0));
       }
@@ -196,13 +205,64 @@ export class TelegramBot {
     const now = this.now();
     for (const [key, entry] of this.actions) if (entry.expires <= now) this.actions.delete(key);
     for (const [key, entry] of this.replies) if (entry.expires <= now) this.replies.delete(key);
+    this.agentNotices.prune();
+    if (this.agentNotices.hasPending && !this.agentEnabled()) this.agentNotices.clear('notifications_unavailable');
   }
-  private async send(text: string, rows?: Button[][], forceReply?: boolean): Promise<Message> {
+  private agentEnabled() {
+    try { return !!this.runtime && this.enabled(this.runtime) && this.state.notifications(this.runtime.control.epoch); }
+    catch { return false; }
+  }
+  async notifyAgent(value: unknown, signal: AbortSignal) {
+    const request = agentRequest(value), r = this.runtime;
+    if (!r || !this.agentEnabled() || this.status !== 'polling') return rejected('notifications_unavailable');
+    if (this.agentResolving) return rejected('context_busy');
+    this.agentResolving = true;
+    let message: AgentMessage;
+    try {
+      let session = request.session;
+      if (request.tmux) {
+        const t = request.tmux;
+        // A pane number alone can collide on another tmux server. Verify the
+        // inherited socket path AND server PID; never guess from cwd or titles.
+        const output = await this.sessions.tmux(['display-message', '-p', '-t', t.pane, '#{socket_path}\t#{pid}\t#{session_name}\t#{pane_id}\t#{pane_dead}']);
+        const [socket, pid, name, pane, dead, extra] = output.trimEnd().split('\t');
+        assertValue(socket === t.socket && pid === String(t.pid) && pane === t.pane && dead === '0' && !extra
+          && /^pt_[a-f0-9]{32}$/.test(name || ''), 409, 'unmanaged_terminal_use_unlinked');
+        session = name!.slice(3);
+      }
+      if (session) this.sessions.get(session); // exact existing metadata; no terminal content read
+      message = { kind: request.kind, text: request.text.trim(), ...(session ? { session } : { project: request.project }) };
+    } finally { this.agentResolving = false; }
+    if (r !== this.runtime || !this.agentEnabled()) return rejected('notifications_unavailable');
+    return this.agentNotices.enqueue(message, r.control.epoch, signal);
+  }
+  private async sendAgentNotice(r: Runtime) {
+    if (!this.agentNotices.hasPending) return;
+    if (!this.agentEnabled()) { this.agentNotices.clear('notifications_unavailable'); return; }
+    const entry = this.agentNotices.take(r.control.epoch);
+    if (!entry) return;
+    let attempted = false;
+    try {
+      const row = entry.session ? this.sessions.get(entry.session) : undefined;
+      const kind = { progress: '📌 Progress', blocked: '🚧 Blocked', question: '❓ Input needed', done: '✅ Done (agent-reported)', error: '⚠️ Error (agent-reported)' }[entry.kind];
+      const source = row ? this.targetText(row) : 'Unlinked agent (no managed session)' + (entry.project ? '\nProject: ' + safeLabel(entry.project) : '');
+      // No parse_mode, preview, arbitrary recipient or automatic terminal input.
+      // Agent-authored claims are deliberately distinct from native observations.
+      await this.send(`${kind}\n${source}\nAgent-written update, not independently verified:\n\n${entry.text}`, [[{ text: row ? 'Target controls' : 'Sessions', bound: row ? { action: 'select', id: row.id } : { action: 'sessions' } }]], false,
+        () => { assertValue(!entry.settled && this.agentEnabled(), 409, 'notification_cancelled'); attempted = true; });
+      this.agentNotices.finish(entry, { status: 'sent', code: 'telegram_accepted' }, true);
+    } catch (error) {
+      // A disable/guard failure AFTER the API call is not proof of non-delivery.
+      this.agentNotices.finish(entry, !attempted && error instanceof HttpError ? rejected(error.code) : { status: 'uncertain', code: 'delivery_unknown' }, true);
+      if (error instanceof TelegramApiError) throw error;
+    }
+  }
+  private async send(text: string, rows?: Button[][], forceReply?: boolean, beforeSend?: () => void): Promise<Message> {
     const r = this.runtime; this.guard(r);
     // Private-chat output is paced to <=1 message/second. One pending operation,
     // using the loop's same sleep slot, not an outbox or a per-message timer queue.
     if (Date.now() < this.nextSend) await this.sleep(this.nextSend - Date.now(), r.abort.signal);
-    this.guard(r); this.nextSend = Date.now() + 1050;
+    this.guard(r); beforeSend?.(); this.nextSend = Date.now() + 1050;
     const nonces: string[] = [];
     // A stale one-use action can always reopen its exact target safely. Never
     // recover by parsing labels/output, guessing a terminal, or replaying input.
@@ -489,6 +549,7 @@ export class TelegramBot {
         if (bound.confirmed) {
           const r = this.runtime!; this.guard(r); this.notifications = bound.enabled === true;
           this.state.setNotifications(r.control.epoch, this.notifications); this.pending.clear(); this.baselineReady = false;
+          if (!this.notifications) this.agentNotices.clear('notifications_off');
         }
         return this.notificationMenu();
       }
@@ -496,7 +557,7 @@ export class TelegramBot {
     }
   }
   private async notificationMenu() {
-    await this.send(`Notifications ${this.notifications ? 'ON' : 'OFF'}, including while the website is closed. An open browser does not suppress alerts. Silent baseline; observed native input-needed / working→ready and verified lifecycle changes only. No automatic output, success claims, legacy activity guesses or offline message queue. Short state transitions may be missed.`, [[{ text: this.notifications ? 'Turn notifications off' : 'Turn notifications on', bound: { action: 'notifications', confirmed: true, enabled: !this.notifications } }], this.cancelRow()]);
+    await this.send(`Notifications ${this.notifications ? 'ON' : 'OFF'}, including while the website is closed. An open browser does not suppress alerts. Silent baseline; observed native input-needed / working→ready and verified lifecycle changes. Local agents can also send short, explicitly labeled agent-written updates through pocketterminal-notify. No automatic output, inferred success claims, legacy activity guesses or offline message queue. Short state transitions may be missed.`, [[{ text: this.notifications ? 'Turn notifications off' : 'Turn notifications on', bound: { action: 'notifications', confirmed: true, enabled: !this.notifications } }], this.cancelRow()]);
   }
   private async observe(r: Runtime) {
     if (this.now() >= this.nextReconcile) {
@@ -534,9 +595,10 @@ export class TelegramBot {
   }
   stats() { return { status: this.status, enabled: !!this.runtime && this.enabled(this.runtime), poller: this.runtime ? 1 : 0,
     monitorTimers: this.timer ? 1 : 0, waitTimers: this.sleeper ? 1 : 0, actions: this.actions.size, replies: this.replies.size,
-    baseline: this.baseline.size, pendingNotifications: this.pending.size, accepted: this.accepted, rejected: this.rejected, effectAttempts: this.effects }; }
+    baseline: this.baseline.size, pendingNotifications: this.pending.size, agentUpdates: this.agentNotices.stats(), accepted: this.accepted, rejected: this.rejected, effectAttempts: this.effects }; }
   async close() {
     this.closing = true; if (this.timer) clearInterval(this.timer); this.timer = undefined;
+    this.agentNotices.close();
     this.runtime?.abort.abort(); this.runtime?.api.close();
     await this.bridges.releaseTelegram(); await this.monitoring; await this.runtime?.done;
     this.actions.clear(); this.replies.clear(); this.baseline.clear(); this.pending.clear();
