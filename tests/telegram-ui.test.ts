@@ -13,6 +13,7 @@ test('Telegram UI routes: only stateless navigation/reading; no terminal authori
   const id = 'a'.repeat(32);
   const routes = [
     { action: 'sessions', offset: 0 }, { action: 'select', id }, { action: 'output', id },
+    ...['all', 'input', 'working', 'ready', 'stopped', 'error', 'other'].map(filter => ({ action: 'sessions', offset: 5, filter })),
     { action: 'help' }, { action: 'kinds' }, { action: 'notifications' }, { action: 'cancel' },
     { action: 'projects', kind: 'shell', offset: 5 }, { action: 'picker', command: 'prompt', offset: 0 },
   ];
@@ -26,6 +27,10 @@ test('Telegram UI routes: only stateless navigation/reading; no terminal authori
   }
   assert.equal(navigationData({ action: 'notifications', confirmed: true }), undefined);
   for (const data of ['n:__proto__', 'n:constructor', 'n:picker:__proto__:0', 'n:sessions:5:extra', 'n:sessions:-1', 'n:sessions:999', 'n:sessions:1', 'n:sessions:00', 'n:select:../root', 'n:' + 'x'.repeat(65)]) assert.equal(parseNavigation(data), undefined);
+  for (const filter of ['__proto__', 'constructor', 'delete', '', 'all:stop']) {
+    assert.equal(navigationData({ action: 'sessions', offset: 0, filter }), undefined);
+    assert.equal(parseNavigation('n:sessions:0:' + filter), undefined);
+  }
   assert(BOT_COMMANDS.length <= 100); assert.equal(new Set(BOT_COMMANDS.map(c => c.command)).size, BOT_COMMANDS.length);
   for (const entry of BOT_COMMANDS) { assert.match(entry.command, /^[a-z_]{1,32}$/); assert(entry.description.length > 0 && entry.description.length <= 256); }
   for (const command of Object.keys(SESSION_COMMANDS)) assert(BOT_COMMANDS.some(c => c.command === command));
@@ -41,7 +46,7 @@ test('Telegram command menu is private-chat scoped; no-ID prompt/stop choose exp
     const b = await f.h.service.sessions.create({ kind: 'shell', label: 'Menu target B' });
     const choices = (await f.send('/prompt')).message;
     assert.match(choices.text, /Choose the exact session/); assert.equal(f.h.service.telegram.stats().effectAttempts, 0);
-    const request = (await f.click(choices, 'Menu target A')).message;
+    const request = (await f.click(choices, f.sessionButton(a))).message;
     assert.match(request.text, /Reply to THIS exact message/); assert.match(request.text, new RegExp(a.id));
     await f.send('/select ' + b.id);
     const marker = path.join(f.h.config.defaultCwd, 'menu-prompt');
@@ -50,7 +55,7 @@ test('Telegram command menu is private-chat scoped; no-ID prompt/stop choose exp
     assert.match(receipt.text, /Input accepted by tmux/); assert(receipt.reply_markup.inline_keyboard.flat().some((x: any) => x.text === 'Enter'));
     await f.send(`printf 'once\\n' >> '${marker}'`, { reply_to_message: request }); assert.equal(fs.readFileSync(marker, 'utf8'), 'once\n');
     const stopChoices = (await f.send('/stop')).message;
-    const confirm = (await f.click(stopChoices, 'Menu target A')).message;
+    const confirm = (await f.click(stopChoices, f.sessionButton(a))).message;
     assert.match(confirm.text, /STOP this job/); assert.equal(f.h.service.sessions.get(a.id).state, 'running');
     await f.click(confirm, 'Cancel / sessions');
     await f.click(confirm, 'Confirm stop'); assert.equal(f.h.service.sessions.get(a.id).state, 'running');
@@ -65,7 +70,7 @@ test('Telegram reusable navigation, output, expiry and cap recovery never replay
   try {
     const row = await f.h.service.sessions.create({ kind: 'shell', label: 'Reusable target' });
     const listing = (await f.send('/sessions')).message;
-    const menu = (await f.click(listing, row.label)).message;
+    const menu = (await f.click(listing, f.sessionButton(row))).message;
     const preview = (await f.click(menu, 'Recent output')).message;
     const first = (await f.click(menu, 'Down')).message; // read-only output did not consume siblings
     assert.match(first.text, /Key accepted by tmux/);
@@ -76,13 +81,13 @@ test('Telegram reusable navigation, output, expiry and cap recovery never replay
     assert(f.fake.calls.some(c => c.method === 'answerCallbackQuery' && /Nothing was sent/.test(c.body.text || '')));
     skew += TG_LIMITS.expiryMs + 20;
     await f.click(stale, 'Enter'); assert.equal(f.h.service.telegram.stats().effectAttempts, 2);
-    const refreshed = (await f.click(listing, row.label)).message;
+    const refreshed = (await f.click(listing, f.sessionButton(row))).message;
     assert.match(refreshed.text, new RegExp(row.id));
     assert.match((await f.click(preview, 'Refresh output')).message.text, /Recent output/);
     // Chooser churn keeps metadata bounded; old navigation is not in that map.
     for (let i = 0; i < 4; i++) await f.send('/rename', { date: Math.floor((Date.now() + skew) / 1000) });
     assert(f.h.service.telegram.stats().actions <= TG_LIMITS.actions);
-    await f.click(listing, row.label); assert.equal(f.h.service.telegram.stats().effectAttempts, 2);
+    await f.click(listing, f.sessionButton(row)); assert.equal(f.h.service.telegram.stats().effectAttempts, 2);
     assert.equal(f.fake.maxActive, 1); assert.equal(f.h.service.bridges.stats().created, 0);
     assert(f.h.service.telegram.stats().waitTimers <= 1);
   } finally { await f.close(); }
@@ -103,7 +108,7 @@ test('Telegram menu setup failure does not stop polling; setup retry is bounded 
     await h.service.close(); fake.fail = '';
     next = await createApp(h.config, { telegram: { endpoint: fake.endpoint } });
     await until(() => next!.telegram.stats().status === 'polling', 6000);
-    const data = listing.reply_markup.inline_keyboard.flat().find((b: any) => b.text === row.label).callback_data;
+    const data = listing.reply_markup.inline_keyboard.flat().find((b: any) => b.callback_data === 'n:select:' + row.id).callback_data;
     const before = fake.sent.length;
     fake.enqueue({ update_id: 2, callback_query: { id: 'old_navigation_after_restart', from: { id: OWNER, is_bot: false }, message: listing, data } });
     await until(() => fake.sent.length > before);

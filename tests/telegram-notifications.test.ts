@@ -37,9 +37,11 @@ test('Telegram observe→send: silent baseline, native ready/input and verified 
     f.panes.set(id, { activity: 'working' }); await f.advance(); assert.equal(f.fake.sent.length, 0);
     let before = f.last(); f.panes.set(id, { activity: 'ready' }); await f.advance();
     const finished = await f.waitMessage(before); assert.match(finished.text, /Observed turn finished \/ ready/); assert.match(finished.text, /NOT a task-success claim/);
+    assert.match(finished.text, /^🟢 READY \/ AWAITING PROMPT/);
     const count = f.fake.sent.length; await f.advance(); assert.equal(f.fake.sent.length, count);
     before = f.last(); f.panes.set(id, { activity: 'awaiting_input' }); await f.advance();
-    assert.match((await f.waitMessage(before)).text, /Native Codex reports input\/action required/);
+    const inputNotice = await f.waitMessage(before);
+    assert.match(inputNotice.text, /Native Codex reports input\/action required/); assert.match(inputNotice.text, /^🟡 NEEDS YOUR INPUT/);
     await f.advance(); assert.equal(f.fake.sent.filter(m => /input\/action required/.test(m.text)).length, 1);
     f.panes.set(id, { activity: 'working' }); await f.advance(); f.panes.set(id, { activity: 'unknown' }); await f.advance();
     const afterUnknown = f.fake.sent.length; f.panes.set(id, { activity: 'ready' }); await f.advance(); assert.equal(f.fake.sent.length, afterUnknown);
@@ -50,8 +52,10 @@ test('Telegram observe→send: silent baseline, native ready/input and verified 
     await f.advance();
     before = f.last(); f.panes.set(legacy, { activity: 'unavailable', dead: 1, status: 0 }); await f.advance();
     const exited = await f.waitMessage(before); assert.match(exited.text, new RegExp(legacy)); assert.match(exited.text, /Session exited/);
+    assert.match(exited.text, /^⚫ STOPPED \/ EXITED/);
     before = f.last(); f.panes.set(id, { activity: 'unavailable', dead: 1, status: 7 }); await f.advance();
-    assert.match((await f.waitMessage(before)).text, /Verified start\/exit error/);
+    const errorNotice = await f.waitMessage(before);
+    assert.match(errorNotice.text, /Verified start\/exit error/); assert.match(errorNotice.text, /^🔴 ERROR/);
     const delivered = f.fake.sent.length; await f.advance(); assert.equal(f.fake.sent.length, delivered);
     assert.equal(f.captures, 0); assert.equal(f.h.service.bridges.stats().created, 0);
     assert.equal(f.h.service.telegram.stats().pendingNotifications, 0);

@@ -1,3 +1,5 @@
+import { isSessionFilter, type SessionFilter } from './telegram-presentation.js';
+
 // Telegram's command menu contains intents, never a mutable selected terminal.
 export const SESSION_COMMANDS = Object.freeze({
   select: 'Open session controls', prompt: 'Send a prompt followed by Enter',
@@ -12,7 +14,7 @@ export const SESSION_COMMANDS = Object.freeze({
 export type SessionCommand = keyof typeof SESSION_COMMANDS;
 export const sessionCommand = (value: string): value is SessionCommand => Object.hasOwn(SESSION_COMMANDS, value);
 export const BOT_COMMANDS = Object.freeze([
-  { command: 'sessions', description: 'List sessions and open their controls' },
+  { command: 'sessions', description: 'Status dashboard: input, working, ready, stopped and errors' },
   { command: 'new', description: 'Create a Codex or shell session' },
   ...Object.entries(SESSION_COMMANDS).map(([command, description]) => ({ command, description })),
   { command: 'website', description: 'Open the live terminal website' },
@@ -24,9 +26,9 @@ export const BOT_COMMANDS = Object.freeze([
 
 export interface Navigation {
   action: 'sessions' | 'select' | 'output' | 'help' | 'kinds' | 'projects' | 'notifications' | 'cancel' | 'picker';
-  id?: string; offset?: number; kind?: 'shell' | 'codex'; command?: SessionCommand;
+  id?: string; offset?: number; kind?: 'shell' | 'codex'; command?: SessionCommand; filter?: SessionFilter;
 }
-type NavigationCandidate = { action: string; id?: string; offset?: number; kind?: string; confirmed?: boolean; command?: string };
+type NavigationCandidate = { action: string; id?: string; offset?: number; kind?: string; confirmed?: boolean; command?: string; filter?: string };
 const page = (value: string | undefined) => value !== undefined && /^(0|[1-9]\d{0,2})$/.test(value) && Number(value) <= 175 && Number(value) % 5 === 0;
 
 // Reusable, stateless routes are deliberately limited to reading/showing menus
@@ -41,6 +43,7 @@ export function parseNavigation(data: string): Navigation | undefined {
     if (parts[1] === 'help' || parts[1] === 'notifications' || parts[1] === 'cancel') return { action: parts[1] };
   }
   if (parts.length === 3 && parts[1] === 'sessions' && page(parts[2])) return { action: 'sessions', offset: Number(parts[2]) };
+  if (parts.length === 4 && parts[1] === 'sessions' && page(parts[2]) && isSessionFilter(parts[3]!)) return { action: 'sessions', offset: Number(parts[2]), filter: parts[3] };
   if (parts.length === 3 && ['select', 'output'].includes(parts[1]!) && /^[a-f0-9]{32}$/.test(parts[2]!)) return { action: parts[1] as 'select' | 'output', id: parts[2] };
   if (parts.length === 4 && parts[1] === 'projects' && ['shell', 'codex'].includes(parts[2]!) && page(parts[3])) return { action: 'projects', kind: parts[2] as 'shell' | 'codex', offset: Number(parts[3]) };
   if (parts.length === 4 && parts[1] === 'picker' && sessionCommand(parts[2]!) && page(parts[3])) return { action: 'picker', command: parts[2] as SessionCommand, offset: Number(parts[3]) };
@@ -49,7 +52,7 @@ export function navigationData(bound: NavigationCandidate): string | undefined {
   if (bound.confirmed) return;
   let data: string | undefined;
   switch (bound.action) {
-    case 'sessions': data = `n:sessions:${bound.offset || 0}`; break;
+    case 'sessions': data = `n:sessions:${bound.offset || 0}${bound.filter === undefined ? '' : ':' + bound.filter}`; break;
     case 'select': case 'output': data = `n:${bound.action}:${bound.id}`; break;
     case 'help': case 'notifications': case 'cancel': data = `n:${bound.action}`; break;
     case 'kinds': data = 'n:new'; break;

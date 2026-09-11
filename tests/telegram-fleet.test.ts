@@ -203,6 +203,11 @@ test('fleet private metadata validation, isolated cursors, bounded immutable cal
     await assert.rejects(joinFleet(worker, invitation));
     const data = `f:${invitation.node.id}:n:select:${'b'.repeat(32)}`;
     assert(Buffer.byteLength(data) <= 64); assert.deepEqual(fleetRoute(data), { node: invitation.node.id, data: 'n:select:' + 'b'.repeat(32) });
+    for (const filter of ['all', 'input', 'working', 'ready', 'stopped', 'error', 'other']) {
+      const inner = 'n:sessions:175:' + filter, route = `f:${invitation.node.id}:${inner}`;
+      assert(Buffer.byteLength(route) <= 64); assert.deepEqual(fleetRoute(route), { node: invitation.node.id, data: inner });
+    }
+    assert.equal(fleetRoute(`f:${invitation.node.id}:n:sessions:0:delete`), undefined);
     assert.equal(fleetRoute(`f:${invitation.node.id}:exec:rm`), undefined);
     assert.equal(fleetRoute(`f:${invitation.node.id}:h:use:${'b'.repeat(16)}`), undefined);
     await removeFleetWorker(config, invitation.node.id);
@@ -260,10 +265,13 @@ test('five VPSs share ONE bot: all-server alerts, exact-target replies/buttons, 
     const mismatch = await hub.app.inject({ method: 'POST', url: '/api/telegram-fleet', headers: { host: new URL(config.origin).host, 'content-type': 'application/json', authorization: 'Bearer ' + grants[0].key, 'x-pocketterminal-node': grants[1].node.id }, payload: {} });
     assert.equal(mismatch.statusCode, 401);
     const bypass = await hub.app.inject({ method: 'GET', url: '/api/sessions', headers: { host: new URL(config.origin).host, authorization: 'Bearer ' + grants[0].key, 'x-pocketterminal-node': grants[0].node.id } }); assert.equal(bypass.statusCode, 401);
-    await choose(2);
+    const catalog2 = await choose(2); assert.match(catalog2.text, /SESSION DASHBOARD/);
     const request = await send('/prompt ' + rows[1]!.id);
     assert(request.text.startsWith('[VPS 2]')); assert(request.reply_markup.force_reply);
     await choose(3);
+    const filtered2 = await click(catalog2, '❔ Other (1)');
+    assert(filtered2.text.startsWith('[VPS 2]')); assert.match(filtered2.text, /Sessions 1–1 of 1/);
+    assert.equal(services[1]!.telegram.stats().effectAttempts, 0);
     const receipt = await send("printf 'once\\n' >> fleet-marker", { reply_to_message: request });
     assert(receipt.text.startsWith('[VPS 2]'));
     const marker = path.join(configs[1]!.defaultCwd, 'fleet-marker'); await until(() => fs.existsSync(marker));

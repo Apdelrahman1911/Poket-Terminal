@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { harness, until } from './helpers.js';
 import { dummyState, fakeTelegram, message, OWNER } from './telegram-fake.js';
+import type { TerminalRow } from '../src/server/sessions.js';
+import { telegramSessionButton } from '../src/server/telegram-presentation.js';
 
 export async function botFixture(name: string, options: Parameters<typeof harness>[1] = {}) {
   const fake = await fakeTelegram();
@@ -30,6 +32,7 @@ export async function botFixture(name: string, options: Parameters<typeof harnes
     if (wait) return { id, message: await waitMessage(after) };
     await until(() => state.cursor(state.control()!.epoch) > id); return { id, message: undefined };
   };
-  return { h, fake, state, push, send, click, last, waitMessage,
+  const sessionButton = (row: TerminalRow) => telegramSessionButton(row.label, h.service.sessions.describe(row));
+  return { h, fake, state, push, send, click, last, waitMessage, sessionButton,
     close: async () => { await h.close(); await fake.close(); } };
 }

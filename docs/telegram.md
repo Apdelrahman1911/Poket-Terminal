@@ -137,6 +137,37 @@ processing/task success. There is no automatic replay or side-effect retry.
 
 ## Notifications and bounds
 
+### Status dashboard
+
+Send **`/sessions`** for a color/emoji-coded dashboard. Session buttons show the
+same status as the grouped sections, with input-needed and errors first:
+
+| Badge | Meaning |
+| --- | --- |
+| 🟡 Needs your input | Native CLI reports that input or an action is required. |
+| 🔵 Working | Native CLI reports active work. |
+| 🟢 Ready / awaiting prompt | Still running, ready for another prompt; **not proof of task success**. |
+| ⚫ Stopped / exited | The session is no longer running; normal exit is not proof of task success. |
+| 🔴 Error | Verified start/exit failure, not a guess from terminal output. |
+| ⚪ Starting / 🟠 Stopping | Transition in progress, not yet confirmed running/stopped. |
+| ❔ Unknown / unreported | Activity or lifecycle is unconfirmed; never presented as stopped, working or successful. |
+
+Use **All / Input / Working / Ready / Stopped / Errors / Other** buttons to
+separate categories; counts refer to the bounded dashboard catalog, not just the
+five entries on the current page. **Other** contains starting/stopping/unknown
+states. **Refresh** rereads status; old messages are explicitly labeled snapshots,
+not a live view. Empty filters show zero entries without invalid page ranges.
+Category/navigation buttons remain reusable, read-only, and bound to their
+original VPS. They never take control or send input. Existing exact-target,
+single-use input/stop/delete confirmations are unchanged.
+
+Native notifications have matching prominent status headings. Agent-written
+progress/question/error/done updates remain explicitly agent-reported and are
+not promoted to verified lifecycle state. All-VPS notifications remain independent
+of the selected VPS/category. No additional poller, timer, output capture, PTY,
+per-chat history, dependency, or persistent list is added: each request reads at
+most 180 existing metadata records and renders five; memory/request bounds remain.
+
 Notifications default ON **including with an open browser**. Baselines are silent;
 alerts dedupe/coalesce observed native needs-input, working→ready (“turn finished /
 ready”, **not task success**), stopped/exited and verified start/exit error. Legacy

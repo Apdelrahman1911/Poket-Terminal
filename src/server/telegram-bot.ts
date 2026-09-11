@@ -9,11 +9,12 @@ import { discardBacklog, TG_LIMITS, TelegramApi, TelegramApiError, TelegramTrans
 import { callback, fresh, Message, privateMessage, userMessage } from './telegram-update.js';
 import { BOT_COMMANDS, navigationData, parseNavigation, SESSION_COMMANDS, SessionCommand, sessionCommand } from './telegram-ui.js';
 import { AgentNotices, agentRequest, rejected, type AgentMessage } from './agent-notices.js';
+import { CATALOG_LIMIT, SESSION_PAGE_SIZE, SESSION_LEGEND, isSessionFilter, telegramLabel, telegramSessionButton, telegramSessionView, type SessionFilter, type SessionView } from './telegram-presentation.js';
 
 type Action = 'sessions' | 'select' | 'kinds' | 'projects' | 'create' | 'rename' | 'text' | 'prompt' | 'key' | 'output' | 'stop' | 'delete' | 'take' | 'release' | 'exit_history' | 'notifications' | 'help' | 'cancel' | 'picker' | 'choose';
 interface Bound {
   action: Action; id?: string; target?: InputTarget; stamp?: string; key?: NativeKey;
-  kind?: 'shell' | 'codex'; project?: string; offset?: number; confirmed?: boolean; enabled?: boolean; command?: SessionCommand;
+  kind?: 'shell' | 'codex'; project?: string; offset?: number; confirmed?: boolean; enabled?: boolean; command?: SessionCommand; filter?: SessionFilter;
 }
 interface Entry extends Bound { expires: number; messageId: number; date: number }
 type Button = { text: string; bound: Bound } | { text: string; url: string };
@@ -21,6 +22,7 @@ interface Runtime { control: TelegramControl; api: TelegramTransport; abort: Abo
 export interface TelegramDriver { state?: TelegramState; factory: () => TelegramTransport; lockName?: 'fleet-local'; enabled?: () => boolean; runtimeValid?: (api: TelegramTransport) => boolean }
 type Observation = { lifecycle: string; activity: string; createdAt: number };
 type Notice = 'stopped' | 'exited' | 'error' | 'awaiting_input' | 'ready';
+type CatalogEntry = { row: TerminalRow; view: SessionView };
 export function telegramCommand(text: string, botUsername: string) {
   if (text.length > 160) return;
   const match = /^\/(\w+)(?:@([A-Za-z][A-Za-z0-9_]{4,31}))?(?: ([a-f0-9]{32}))?$/.exec(text);
@@ -28,15 +30,14 @@ export function telegramCommand(text: string, botUsername: string) {
   return { cmd: match[1]!, id: match[3] };
 }
 const projectId = (value: string) => createHash('sha256').update(value).digest('hex');
-const safeLabel = (value: string) => value.replace(/[\u202a-\u202e\u2066-\u2069]/g, '').slice(0, 80);
+const safeLabel = telegramLabel;
 export function telegramText(value: string, limit: number = TG_LIMITS.text) {
   let text = value.slice(0, limit);
   if (/[\ud800-\udbff]$/.test(text)) text = text.slice(0, -1);
   return text || '(empty)';
 }
 export function telegramStatus(description: { lifecycle: string; activity: string }) {
-  if (description.lifecycle === 'running') return description.activity === 'working' ? 'Working' : description.activity === 'awaiting_input' ? 'Input needed' : description.activity === 'ready' ? 'Ready for input (not a success claim)' : description.activity === 'unknown' ? 'Running · activity unknown' : 'Running · activity not reported';
-  return ({ starting: 'Starting', stopping: 'Stopping', stopped: 'Stopped', exited: 'Exited', error: 'Error (verified start/exit failure)', unknown: 'Unknown lifecycle' } as Record<string, string>)[description.lifecycle] || 'Unknown';
+  return telegramSessionView(description).label;
 }
 export function notification(previous: Observation | undefined, next: Observation): Notice | undefined {
   if (!previous) return;
@@ -244,7 +245,7 @@ export class TelegramBot {
     let attempted = false;
     try {
       const row = entry.session ? this.sessions.get(entry.session) : undefined;
-      const kind = { progress: '📌 Progress', blocked: '🚧 Blocked', question: '❓ Input needed', done: '✅ Done (agent-reported)', error: '⚠️ Error (agent-reported)' }[entry.kind];
+      const kind = { progress: '🔵 PROGRESS UPDATE', blocked: '🟠 BLOCKED (agent-reported)', question: '🟡 INPUT NEEDED (agent-reported)', done: '✅ DONE (agent-reported)', error: '🔴 ERROR (agent-reported)' }[entry.kind];
       const source = row ? this.targetText(row) : 'Unlinked agent (no managed session)' + (entry.project ? '\nProject: ' + safeLabel(entry.project) : '');
       // No parse_mode, preview, arbitrary recipient or automatic terminal input.
       // Agent-authored claims are deliberately distinct from native observations.
@@ -390,32 +391,62 @@ export class TelegramBot {
   }
   private cancelRow(): Button[] { return [{ text: 'Cancel / sessions', bound: { action: 'cancel' } }]; }
   private async help() {
-    await this.send(`PocketTerminal ROOT control · @${this.state.identity().username}\nUse Telegram’s Menu button beside the message field. Commands such as /prompt or /output ask you to choose a session; no ID typing required. Explicit /prompt ID etc. still work.\n\n/sessions — list/select/page; each action names its target\n/new — Codex or shell in an existing allowed project\n/select · /send · /paste · /prompt · /rename\n/output · /stop · /delete · /take · /release · /live\n/enter · /esc · /tab · /up · /down · /left · /right · /interrupt\n/website · /notifications · /cancel · /help\n\nNavigation and recent-output buttons are reusable. Old/used terminal actions only refresh controls: NOTHING is replayed; use the new buttons. Keys/input return fresh controls automatically.\nReply to the bot’s exact 2-minute input request. Other text is NEVER executed. Paste is literal (4 KiB), prompt adds Enter; Ctrl+C interrupts. Exit history cancels tmux copy mode, not shell input.\n\nBrowsers and Telegram share control; SSH is independent. Existing/older Codex and shells may not report activity. Ready/turn finished is NOT task success; internal CLI errors are not detected unless the job exits with a verified error. Notifications use observed native state only; short transitions may be missed. Telegram bot chats are NOT end-to-end encrypted. Do not send secrets.`, [[{ text: 'Sessions', bound: { action: 'sessions' } }, { text: 'New session', bound: { action: 'kinds' } }], [{ text: 'Notifications', bound: { action: 'notifications' } }]]);
+    await this.send(`PocketTerminal ROOT control · @${this.state.identity().username}\nUse Telegram’s Menu button beside the message field. Commands such as /prompt or /output ask you to choose a session; no ID typing required. Explicit /prompt ID etc. still work.\n\n${SESSION_LEGEND}\n\n/sessions — colored status sections and category buttons; Refresh updates the snapshot; each action names its target\n/new — Codex or shell in an existing allowed project\n/select · /send · /paste · /prompt · /rename\n/output · /stop · /delete · /take · /release · /live\n/enter · /esc · /tab · /up · /down · /left · /right · /interrupt\n/website · /notifications · /cancel · /help\n\nNavigation and recent-output buttons are reusable. Old/used terminal actions only refresh controls: NOTHING is replayed; use the new buttons. Keys/input return fresh controls automatically.\nReply to the bot’s exact 2-minute input request. Other text is NEVER executed. Paste is literal (4 KiB), prompt adds Enter; Ctrl+C interrupts. Exit history cancels tmux copy mode, not shell input.\n\nBrowsers and Telegram share control; SSH is independent. Existing/older Codex and shells may not report activity. Ready/turn finished is NOT task success; internal CLI errors are not detected unless the job exits with a verified error. Notifications use observed native state only; short transitions may be missed. Telegram bot chats are NOT end-to-end encrypted. Do not send secrets.`, [[{ text: 'Sessions', bound: { action: 'sessions' } }, { text: 'New session', bound: { action: 'kinds' } }], [{ text: 'Notifications', bound: { action: 'notifications' } }]]);
   }
-  private async catalog(offset: number) {
+  private catalogEntries(): CatalogEntry[] {
+    // At most the existing 180-row metadata archive, only for this request.
+    // No output capture, retained per-chat list, extra polling or terminal PTYs.
+    const rows = this.sessions.list(100);
+    if (rows.length === 100) rows.push(...this.sessions.list(CATALOG_LIMIT - 100, 100));
+    return rows.map(row => ({ row, view: telegramSessionView(this.sessions.describe(row)) }))
+      .sort((a, b) => a.view.rank - b.view.rank); // stable within each status
+  }
+  private pageOffset(offset: number, length: number) {
+    const last = Math.max(0, Math.floor((length - 1) / SESSION_PAGE_SIZE) * SESSION_PAGE_SIZE);
+    return Number.isInteger(offset) ? Math.max(0, Math.min(last, Math.floor(offset / SESSION_PAGE_SIZE) * SESSION_PAGE_SIZE)) : 0;
+  }
+  private groupedSessions(entries: CatalogEntry[]) {
+    let heading = '';
+    return entries.map(({ row, view }) => {
+      const prefix = view.heading === heading ? '' : (heading ? '\n' : '') + view.heading + '\n';
+      heading = view.heading;
+      return `${prefix}${this.targetText(row)}\n${view.label}`;
+    }).join('\n\n');
+  }
+  private async catalog(offset: number, filter: SessionFilter = 'all') {
     await this.sessions.reconcile(); this.guard();
-    offset = Number.isInteger(offset) ? Math.max(0, Math.min(175, offset)) : 0;
-    const rows = this.sessions.list(5, offset);
-    const buttons: Button[][] = rows.map(row => [{ text: safeLabel(row.label), bound: { action: 'select', id: row.id } }]);
+    assertValue(isSessionFilter(filter), 400, 'invalid_session_filter');
+    const entries = this.catalogEntries(), filtered = entries.filter(entry => filter === 'all' || entry.view.filter === filter);
+    offset = this.pageOffset(offset, filtered.length);
+    const shown = filtered.slice(offset, offset + SESSION_PAGE_SIZE);
+    const counts: Record<SessionFilter, number> = { all: entries.length, input: 0, working: 0, ready: 0, stopped: 0, error: 0, other: 0 };
+    for (const entry of entries) counts[entry.view.filter]++;
+    const names: Record<SessionFilter, string> = { all: '📋 All', input: '🟡 Input', working: '🔵 Working', ready: '🟢 Ready', stopped: '⚫ Stopped', error: '🔴 Errors', other: '❔ Other' };
+    const tab = (key: SessionFilter): Button => ({ text: `${filter === key ? '✓ ' : ''}${names[key]} (${counts[key]})`, bound: { action: 'sessions', filter: key, offset: 0 } });
+    const buttons: Button[][] = [[tab('all'), tab('input'), tab('working')], [tab('ready'), tab('stopped'), tab('error')],
+      [tab('other'), { text: '🔄 Refresh', bound: { action: 'sessions', filter, offset } }],
+      ...shown.map(({ row, view }) => [{ text: telegramSessionButton(row.label, view), bound: { action: 'select' as const, id: row.id } }])];
     const nav: Button[] = [];
-    if (offset) nav.push({ text: 'Previous', bound: { action: 'sessions', offset: Math.max(0, offset - 5) } });
-    if (rows.length === 5 && offset < 175) nav.push({ text: 'Next', bound: { action: 'sessions', offset: offset + 5 } });
+    if (offset) nav.push({ text: 'Previous', bound: { action: 'sessions', filter, offset: offset - SESSION_PAGE_SIZE } });
+    if (offset + shown.length < filtered.length) nav.push({ text: 'Next', bound: { action: 'sessions', filter, offset: offset + SESSION_PAGE_SIZE } });
     if (nav.length) buttons.push(nav);
     buttons.push([{ text: 'New session', bound: { action: 'kinds' } }, { text: 'Help', bound: { action: 'help' } }, { text: 'Open website', url: this.config.origin }]);
-    await this.send(`Sessions ${offset + 1}–${offset + rows.length}\n${rows.length ? rows.map(row => `${this.targetText(row)}\n${telegramStatus(this.sessions.describe(row))}`).join('\n\n') : 'No entries on this page.'}\n\nSelect a target below. ${this.config.origin}`, buttons);
+    const range = shown.length ? `${offset + 1}–${offset + shown.length} of ${filtered.length}` : '0';
+    await this.send(`🖥 SESSION DASHBOARD — ${names[filter]}\nSessions ${range} · ${entries.length} listed\n🟡 Input ${counts.input} · 🔵 Working ${counts.working} · 🟢 Ready ${counts.ready}\n⚫ Stopped ${counts.stopped} · 🔴 Errors ${counts.error} · ❔ Other ${counts.other}\n\n${shown.length ? this.groupedSessions(shown) : 'No sessions in this category.'}\n\nSnapshot, not live. Tap 🔄 Refresh to update.\nReady ≠ stopped or task success. ❔ Other includes unknown activity / starting / stopping.\nChoose a category or an exact session below.`, buttons);
   }
   private async picker(command: SessionCommand, offset: number) {
     assertValue(sessionCommand(command), 400, 'unknown_command');
     await this.sessions.reconcile(); this.guard();
-    offset = Number.isInteger(offset) ? Math.max(0, Math.min(175, offset)) : 0;
-    const rows = this.sessions.list(5, offset);
-    const buttons: Button[][] = rows.map(row => [{ text: safeLabel(row.label), bound: { action: 'choose', command, id: row.id } }]);
+    const entries = this.catalogEntries();
+    offset = this.pageOffset(offset, entries.length);
+    const shown = entries.slice(offset, offset + SESSION_PAGE_SIZE);
+    const buttons: Button[][] = shown.map(({ row, view }) => [{ text: telegramSessionButton(row.label, view), bound: { action: 'choose', command, id: row.id } }]);
     const nav: Button[] = [];
     if (offset) nav.push({ text: 'Previous', bound: { action: 'picker', command, offset: offset - 5 } });
-    if (rows.length === 5 && offset < 175) nav.push({ text: 'Next', bound: { action: 'picker', command, offset: offset + 5 } });
+    if (offset + shown.length < entries.length) nav.push({ text: 'Next', bound: { action: 'picker', command, offset: offset + SESSION_PAGE_SIZE } });
     if (nav.length) buttons.push(nav);
     buttons.push([{ text: 'Refresh choices', bound: { action: 'picker', command, offset } }], this.cancelRow());
-    await this.send(`/${command} — ${SESSION_COMMANDS[command]}\nChoose the exact session below. No terminal input has been sent.\n\n${rows.length ? rows.map(row => `${this.targetText(row)}\n${telegramStatus(this.sessions.describe(row))}`).join('\n\n') : 'No entries on this page.'}`, buttons);
+    await this.send(`/${command} — ${SESSION_COMMANDS[command]}\nChoose the exact session below. No terminal input has been sent.\n\n${shown.length ? this.groupedSessions(shown) : 'No entries on this page.'}\n\nSnapshot, not live. Refresh choices to update.`, buttons);
   }
   private async selected(id: string, receipt?: string) {
     await this.sessions.reconcile(); this.guard();
@@ -435,7 +466,8 @@ export class TelegramBot {
       buttons.push([{ text: 'Stop…', bound: { action: 'stop', id } }]);
     } else if (row.state === 'stopped') buttons.push([{ text: 'Delete stopped entry…', bound: { action: 'delete', id } }]);
     buttons.push([{ text: 'Rename', bound: { action: 'rename', id } }, { text: 'Open website', url: this.config.origin }], this.cancelRow());
-    await this.send(`${receipt ? receipt + '\n\n' : ''}${this.targetText(row)}\n${telegramStatus(description)}\nInput controller: ${controller.kind}.\nAll buttons target this entry, not a mutable selection.`, buttons);
+    const view = telegramSessionView(description);
+    await this.send(`${view.heading}\n${receipt ? receipt + '\n\n' : ''}${this.targetText(row)}\n${view.detail}\nInput controller: ${controller.kind}.\nAll buttons target this entry, not a mutable selection.`, buttons);
   }
   private async inputReceipt(id: string, receipt: string) {
     try { await this.selected(id, receipt); }
@@ -490,7 +522,7 @@ export class TelegramBot {
     const id = bound.id;
     switch (bound.action) {
       case 'help': return this.help();
-      case 'sessions': return this.catalog(bound.offset || 0);
+      case 'sessions': return this.catalog(bound.offset || 0, bound.filter);
       case 'select': return this.selected(id!);
       case 'kinds': return this.kinds();
       case 'projects': return this.projects(bound.kind!, bound.offset || 0);
@@ -543,7 +575,7 @@ export class TelegramBot {
         this.pending.delete(id!);
         if (bound.action === 'delete') this.baseline.delete(id!);
         else if (this.baseline.has(id!)) this.baseline.set(id!, { ...this.sessions.describe(this.sessions.get(id!)), createdAt: row.created_at });
-        await this.send(`${bound.action === 'stop' ? 'Stopped' : 'Removed stopped metadata only'}: ${id}`, [this.cancelRow()]); return;
+        await this.send(`${bound.action === 'stop' ? '⚫ Stopped' : '🗑 Removed stopped metadata only'}: ${id}`, [this.cancelRow()]); return;
       }
       case 'notifications': {
         if (bound.confirmed) {
@@ -557,7 +589,7 @@ export class TelegramBot {
     }
   }
   private async notificationMenu() {
-    await this.send(`Notifications ${this.notifications ? 'ON' : 'OFF'}, including while the website is closed. An open browser does not suppress alerts. Silent baseline; observed native input-needed / working→ready and verified lifecycle changes. Local agents can also send short, explicitly labeled agent-written updates through pocketterminal-notify. No automatic output, inferred success claims, legacy activity guesses or offline message queue. Short state transitions may be missed.`, [[{ text: this.notifications ? 'Turn notifications off' : 'Turn notifications on', bound: { action: 'notifications', confirmed: true, enabled: !this.notifications } }], this.cancelRow()]);
+    await this.send(`${SESSION_LEGEND}\n\nNotifications ${this.notifications ? 'ON' : 'OFF'}, including while the website is closed. An open browser does not suppress alerts. Silent baseline; observed native input-needed / working→ready and verified lifecycle changes. Local agents can also send short, explicitly labeled agent-written updates through pocketterminal-notify. No automatic output, inferred success claims, legacy activity guesses or offline message queue. Short state transitions may be missed.`, [[{ text: this.notifications ? 'Turn notifications off' : 'Turn notifications on', bound: { action: 'notifications', confirmed: true, enabled: !this.notifications } }], this.cancelRow()]);
   }
   private async observe(r: Runtime) {
     if (this.now() >= this.nextReconcile) {
@@ -591,7 +623,7 @@ export class TelegramBot {
     const latest = this.sessions.describe(row);
     if ((event === 'ready' || event === 'awaiting_input') ? latest.lifecycle !== 'running' || latest.activity !== event : latest.lifecycle !== event) return;
     const message = { ready: 'Observed turn finished / ready for input. NOT a task-success claim.', awaiting_input: 'Native Codex reports input/action required.', error: 'Verified start/exit error.', stopped: 'Session stopped / no longer running.', exited: 'Session exited.' }[event];
-    await this.send(`${this.targetText(row)}\n${message}`, [[{ text: 'Target controls', bound: { action: 'select', id } }]]);
+    await this.send(`${telegramSessionView(latest).heading}\n${this.targetText(row)}\n${message}`, [[{ text: 'Target controls', bound: { action: 'select', id } }]]);
   }
   stats() { return { status: this.status, enabled: !!this.runtime && this.enabled(this.runtime), poller: this.runtime ? 1 : 0,
     monitorTimers: this.timer ? 1 : 0, waitTimers: this.sleeper ? 1 : 0, actions: this.actions.size, replies: this.replies.size,
